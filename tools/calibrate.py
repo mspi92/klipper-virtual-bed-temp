@@ -28,6 +28,7 @@ import random
 import select
 import signal
 import sys
+import termios
 import threading
 import time
 import urllib.request
@@ -225,11 +226,18 @@ def fmt_t(s):
     return '%d:%02d' % (s // 60, s % 60)
 
 
+def flush_typeahead():
+    """Discard keystrokes typed before a prompt, so they cannot answer it."""
+    if sys.stdin.isatty():
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+
 def ask(prompt, auto=None):
-    """input() with optional automatic answer (echoed)."""
+    """input() with optional automatic answer (echoed); typeahead discarded."""
     if auto is not None:
         print(prompt + str(auto))
         return str(auto)
+    flush_typeahead()
     return input(prompt)
 
 
@@ -238,6 +246,7 @@ def ask_yes(prompt, default, auto=None):
     if auto is not None:
         print(prompt + ('y' if auto else 'n'))
         return auto
+    flush_typeahead()
     ans = input(prompt).strip().lower()
     return default if not ans else ans.startswith('y')
 
@@ -333,7 +342,13 @@ class Session:
         if not ask_yes('Bed off for at least 1 hour? [y/N] ', False,
                        True if self.auto else None):
             sys.exit('let it cool first, then run again')
-        self.b.sleep(a.baseline)
+        end = self.b.now() + a.baseline
+        while self.b.now() < end:
+            sys.stdout.write('\r  checking the bed temperature is stable … %2.0f s '
+                             % max(end - self.b.now(), 0.))
+            sys.stdout.flush()
+            self.b.sleep(1.)
+        print('\r  checking the bed temperature is stable … done   ')
         if not self.rec.samples:
             sys.exit('no data from Moonraker during %d s baseline' % a.baseline)
         pad, _, _ = self.rec.series(self.rec.samples[0][0])
@@ -355,7 +370,7 @@ class Session:
     def start_heating(self):
         a = self.a
         if not self.auto:
-            input('\nPress Enter to start heating (sends M140 S%.0f) ' % a.target)
+            ask('\nPress Enter to start heating (sends M140 S%.0f) ' % a.target)
         self.b.gcode('M140 S%.0f' % a.target)
         self.t0 = self.b.now()
         self.heating = True
