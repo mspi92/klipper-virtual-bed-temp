@@ -125,8 +125,9 @@ What it does:
 - Beeps every 5 minutes and asks for an IR reading of the plate. Type the number and press Enter.
   The reading is dated 10 s before you pressed Enter, to allow for walking back to the keyboard.
 - After each reading, shows how far the currently configured model is off and a preliminary fit.
-- Finishes once there is enough data (at least 25 min, and enough power data to cover the plate's
-  heat-up). Then it prints the recommended values and the change from your current config.
+- Finishes once there is enough data: at least 15 min, at least 2 readings, and power data covering
+  1.25 plate time constants. That is about 15–20 min for typical beds; in simulations, recording
+  longer didn't improve accuracy. Then it prints the recommended values and the change from your current config.
   Optionally it applies them to the running Klipper with `SET_VIRTUAL_BED_TEMP` for testing.
 - Saves the session as `~/calib-<date>.json/.csv`, which `fit_tau.py --load … --csv …` can re-fit.
 
@@ -155,17 +156,17 @@ temperature_store_size: 3600   # seconds of history
    the best resolution.
 3. Take two IR thermometer readings of the plate surface, near the centre:
    - one at about **7 min**, while the plate is still clearly rising;
-   - one at about **25 min**, when the plate is nearly settled.
+   - one at about **15–20 min**, when the plate is close to settled.
 
    Measure on the PEI sheet (emissivity ≈ 0.9). Bare aluminium reflects too much for IR to read
    correctly. Hold the thermometer the same way both times.
-4. Wait until at least 25 minutes have passed, with nothing else heating or moving.
+4. Wait until at least 20 minutes have passed, with nothing else heating or moving.
 
 Write the readings to `ir.csv` as `seconds_since_M140,temp`:
 
 ```
 420,51.5
-1500,73.0
+1100,70.5
 ```
 
 #### 3. Fit
@@ -192,7 +193,7 @@ period after the pad first reaches its target.
 Put the values in your config and restart Klipper. On a later cold heat-up to a different
 target (e.g. 60 °C), compare an IR reading with the `virtual_bed_temp` value in Mainsail.
 
-**Accuracy.** The plate's rate comes from about 20 minutes of power data, so IR timing and reading
+**Accuracy.** The plate's rate comes from 10+ minutes of power data, so IR timing and reading
 errors hardly affect it. In simulations with a noisy controller and IR readings off by ±0.6 °C,
 the tool recovered `time_constant` within 1 % and `loss` within 0.003
 (`tools/fit_tau.py --selftest TAU LOSS [--csv …]`). The weakest link is the IR thermometer's

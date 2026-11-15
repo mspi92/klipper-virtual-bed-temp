@@ -457,9 +457,10 @@ class Session:
         if el < a.min_duration:
             return False, ''
         r = self.analyze(quiet=True)
-        if r and r['power_s'] >= 2.5 * r['tau_eff'] and len(self.readings) >= 2:
-            return True, 'enough data recorded (%.0f s of power ≥ 2.5 × %.0f s).' % (
-                r['power_s'], r['tau_eff'])
+        need = fit_tau.MIN_POWER_SPANS * (r['tau_eff'] if r else 0.)
+        if r and r['power_s'] >= need and len(self.readings) >= 2:
+            return True, 'enough data recorded (%.0f s of power ≥ %.0f s needed).' % (
+                r['power_s'], need)
         return False, ''
 
     # --- data -----------------------------------------------------------
@@ -483,7 +484,8 @@ class Session:
         if r:
             self.say('  preliminary: time_constant ≈ %.0f, loss ≈ %.3f '
                      '(%.0f s power data, want ≥ %.0f)'
-                     % (r['tau'], r['loss'], r['power_s'], 2.5 * r['tau_eff']))
+                     % (r['tau'], r['loss'], r['power_s'],
+                        fit_tau.MIN_POWER_SPANS * r['tau_eff']))
 
     def analyze(self, quiet=False):
         pad, power, _ = self.rec.series(self.t0)
@@ -586,7 +588,7 @@ def main():
                     help='seconds between reading prompts (default 300)')
     ap.add_argument('--entry-delay', type=int, default=10,
                     help='a reading is dated this many s before Enter (default 10)')
-    ap.add_argument('--min-duration', type=int, default=1500, help='s (default 1500)')
+    ap.add_argument('--min-duration', type=int, default=900, help='s (default 900)')
     ap.add_argument('--max-duration', type=int, default=3600, help='s (default 3600)')
     ap.add_argument('--skip', type=int, default=120,
                     help='controller settling excluded from the power fit, s')

@@ -35,6 +35,9 @@ import urllib.request
 DT = 1.  # Moonraker temperature_store sample interval, s
 LOSS_GRID = [i * 0.002 for i in range(151)]  # 0 .. 0.3
 TAU_RANGE = (20., 5000.)
+# Power data needed, in plate time constants: Monte-Carlo (IR sigma 1 °C)
+# showed no accuracy gain beyond ~1.25 (≈ 15 min for a 450 s plate)
+MIN_POWER_SPANS = 1.25
 
 
 def fetch_store(url):
@@ -167,9 +170,10 @@ def analyze(heater, power, target, ref, t_init, ambient, skip=120,
     if amp <= 0:
         warnings.append('power is not decaying — wrong window?'
                         ' check --skip/--start-ago')
-    if len(power) * DT < 2.5 * tau_eff:
-        warnings.append('power record covers < 2.5 time constants'
-                        ' — rate still uncertain, record longer')
+    if len(power) * DT < MIN_POWER_SPANS * tau_eff:
+        warnings.append('power record covers < %.2g time constants'
+                        ' — rate still uncertain, record longer'
+                        % MIN_POWER_SPANS)
     ref = [(i, t) for i, t in ref if 0 < i < len(heater)]
     free = None
     if ref and fit_loss:
