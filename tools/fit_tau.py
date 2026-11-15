@@ -32,7 +32,10 @@ import sys
 import urllib.request
 
 DT = 1.  # Moonraker temperature_store sample interval, s
-LOSS_GRID = [i * 0.002 for i in range(151)]  # 0 .. 0.3
+# 0 .. 1.0 (module maximum); open printers measured ~0.35 (plate 15 °C below
+# an 80 °C pad). Coarse grid for the 2-D readings-only cross-check.
+LOSS_GRID = [i * 0.002 for i in range(501)]
+LOSS_GRID_COARSE = [i * 0.02 for i in range(51)]
 TAU_RANGE = (20., 5000.)
 # Power data needed, in plate time constants: Monte-Carlo (IR sigma 1 °C)
 # showed no accuracy gain beyond ~1.25 (≈ 15 min for a 450 s plate)
@@ -135,7 +138,7 @@ def fit_loss_constrained(heater, ref, t_init, ambient, tau_eff):
 def fit_free(heater, ref, t_init, ambient, fit_loss=True):
     """Best (tau, loss, rms) from plate readings alone."""
     best = None
-    for loss in (LOSS_GRID[::5] if fit_loss else [0.]):
+    for loss in (LOSS_GRID_COARSE if fit_loss else [0.]):
         def err(tau):
             return rms(simulate(heater, tau, loss, t_init, ambient), ref)
         tau = golden(err, *TAU_RANGE)

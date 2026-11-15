@@ -4,6 +4,7 @@ import glob
 import io
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -37,9 +38,9 @@ class EndToEnd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             s, out = run(printer, tmp)
             self.assertIsInstance(s, calibrate.Session, out)
-            # s.analyze() now would include samples taken after the report
-            # (heater off), so check the printed and applied recommendation
             tau = float(out.split('Recommended:  time_constant')[1].split()[0])
+            # analysis is pinned to the measurement end, not to later samples
+            self.assertEqual(round(s.analyze()['tau']), tau)
             self.assertAlmostEqual(tau, 450., delta=25., msg=out)
             # applied to the running model, heater off, idle timeout restored
             self.assertEqual(printer.model_tau, tau)
@@ -51,10 +52,15 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(printer.bed.target, 0.)
             # run length adapts: ~15 min for a 450 s plate
             self.assertLess(s.readings[-1][0], 20 * 60, out)
-            # saved session re-fits to the same result
+            # saved session ends at the measurement end and re-fits the same
             js = glob.glob(os.path.join(tmp, 'calib-*.json'))
             self.assertEqual(len(js), 1)
-            self.assertTrue(os.path.exists(js[0][:-5] + '.csv'))
+            refit = subprocess.run(
+                [sys.executable, '-B', os.path.join(HERE, '..', 'tools', 'fit_tau.py'),
+                 '--load', js[0], '--csv', js[0][:-5] + '.csv'],
+                capture_output=True, text=True, check=True).stdout
+            self.assertAlmostEqual(
+                float(refit.split('time_constant:')[1].split()[0]), tau, delta=5.)
 
     def test_external_heater_off_aborts(self):
         """Idle timeout fires because SET_IDLE_TIMEOUT is dropped: run aborts

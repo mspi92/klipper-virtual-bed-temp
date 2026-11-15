@@ -55,6 +55,17 @@ class WithReadings(unittest.TestCase):
             err = max(abs(m - t) for m, t in zip(model, vtrue))
             self.assertLess(err, 2., 'seed %d' % seed)
 
+    def test_high_loss_open_printer(self):
+        """Plate settling ~15 °C below an 80 °C pad (loss 0.36, as measured
+        on an open Voron): loss recovered, no upper-bound warning."""
+        tau, loss = 254., 0.356
+        pad, pw, true = heatup(tau, loss, 15)
+        ref = [(t, true[t]) for t in (300, 600, 880)]
+        r = fit_tau.analyze(pad, pw, 80., ref, 22., 22.)
+        self.assertAlmostEqual(r['loss'], loss, delta=0.03)
+        self.assertAlmostEqual(r['tau'], tau, delta=0.05 * tau)
+        self.assertFalse(any('upper bound' in w for w in r['warnings']))
+
     def test_cross_check_warns_on_bad_timing(self):
         pad, pw, true = heatup(450., 0.02, 20)
         # readings attributed to twice their real time: plate looks much slower

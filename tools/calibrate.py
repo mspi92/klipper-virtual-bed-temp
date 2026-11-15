@@ -107,9 +107,9 @@ class Recorder(threading.Thread):
         with self.lock:
             return self.samples[-1] if self.samples else None
 
-    def series(self, t0):
-        """1 Hz arrays from t0 (index 0 = t0) up to the newest sample, each
-        second taking the latest sample at or before it.
+    def series(self, t0, t_end=None):
+        """1 Hz arrays from t0 (index 0 = t0) up to t_end (default: newest
+        sample), each second taking the latest sample at or before it.
         Returns (pad, power, model) lists; model entries may be None."""
         with self.lock:
             samples = list(self.samples)
@@ -117,7 +117,8 @@ class Recorder(threading.Thread):
         j = 0
         if not samples:
             return pad, power, model
-        n = int(samples[-1][0] - t0) + 1
+        last = samples[-1][0] if t_end is None else min(samples[-1][0], t_end)
+        n = int(last - t0) + 1
         for i in range(max(n, 0)):
             t = t0 + i
             while j + 1 < len(samples) and samples[j + 1][0] <= t:
@@ -217,6 +218,9 @@ class Session:
         self.model_cfg = None
         self.idle_orig = None  # configured idle timeout, s; None if unknown
         self.idle_raised = False
+        # End of the measurement; analysis and saved data stop here, so
+        # samples taken while answering the final prompts do not count
+        self.t_end = None
 
     def say(self, *lines):
         print('\n'.join(lines))
@@ -313,6 +317,11 @@ class Session:
                  % fmt_t(a.interval))
 
     def run(self):
+        self._measure()
+        # last sample already recorded, so later analyses see identical data
+        self.t_end = self.rec.last()[0]
+
+    def _measure(self):
         a = self.a
         next_prompt = a.interval
         last_status = -1e9
@@ -399,7 +408,7 @@ class Session:
                         fit_tau.MIN_POWER_SPANS * r['tau_eff']))
 
     def analyze(self, quiet=False):
-        pad, power, _ = self.rec.series(self.t0)
+        pad, power, _ = self.rec.series(self.t0, self.t_end)
         ref = [(int(round(t)), v) for t, v in self.readings]
         try:
             return fit_tau.analyze(pad, power, self.a.target, ref, self.t_init,
@@ -455,7 +464,7 @@ class Session:
                             time.strftime('calib-%Y%m%d-%H%M%S'))
         first = self.rec.samples[0][0] if self.rec.samples else self.t0
         lead = max(int(self.t0 - first), 1)
-        pad, power, model = self.rec.series(self.t0 - lead)
+        pad, power, model = self.rec.series(self.t0 - lead, self.t_end)
         targets = [0.] * lead + [self.a.target] * (len(pad) - lead)
         store = {self.a.heater: {'temperatures': pad, 'targets': targets,
                                  'powers': power}}
