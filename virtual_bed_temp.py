@@ -138,9 +138,9 @@ class VirtualBedTemp:
         """MARGIN= (°C, default 2, >0).
 
         Goal is steady_state(heater target) - MARGIN, so it is reachable for
-        any loss. Returns immediately if the heater is off. Blocks the G-code
-        queue like M190 (only an emergency stop interrupts it). Reports
-        progress every 60 s.
+        any loss. Returns immediately if the heater is off, and as soon as
+        its target drops to 0 while waiting. Blocks the G-code queue like
+        M190. Reports progress every 60 s.
         """
         margin = gcmd.get_float('MARGIN', 2., above=0.)
         if self.printer.get_start_args().get('debugoutput') is not None:
@@ -157,6 +157,10 @@ class VirtualBedTemp:
         toolhead.get_last_move_time()
         last_report = None
         while not self.printer.is_shutdown() and self.temp < goal:
+            if self.heater.get_temp(eventtime)[1] <= 0.:
+                gcmd.respond_info("%s: %s turned off, stopped waiting"
+                                  % (self.name, self.heater_name))
+                return
             if last_report is None or eventtime - last_report >= 60.:
                 gcmd.respond_info("%s: plate %.1f / %.1f"
                                   % (self.name, self.temp, goal))

@@ -167,6 +167,16 @@ class Module(unittest.TestCase):
         self.assertGreaterEqual(s.temp, steady - 2.)
         self.assertLess(s.temp, steady - 1.5)
 
+    def test_wait_stops_when_heater_turned_off(self):
+        p, s = make({'time_constant': 300})
+        p.heater.target = 80.
+        p.reactor.register_timer(
+            lambda t: setattr(p.heater, 'target', 0.) or 1e9, 60.)
+        g = GCmd()
+        p.gcode.mux[('WAIT_VIRTUAL_BED_TEMP', None)](g)
+        self.assertIn('turned off', g.messages[-1])
+        self.assertLess(p.reactor.t, 70.)
+
     def test_set_command(self):
         p, s = make()
         g = GCmd(TIME_CONSTANT=500, LOSS=0.03, TEMP=40)
