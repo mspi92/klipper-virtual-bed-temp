@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'tools'))
 sys.path.insert(0, HERE)
 import calibrate  # noqa: E402
 import fit_tau  # noqa: E402
-from sim import SimPrinter  # noqa: E402
+from sim import SLOW_WATTS, SimPrinter  # noqa: E402
 
 
 def run(printer, tmp):
@@ -61,6 +61,24 @@ class EndToEnd(unittest.TestCase):
                 capture_output=True, text=True, check=True).stdout
             self.assertAlmostEqual(
                 float(refit.split('time_constant:')[1].split()[0]), tau, delta=5.)
+
+    def test_schedule_on_slow_printer(self):
+        """Measured-printer-like bed: readings on the 3 min grid, each one
+        announced, run ends at a scheduled reading (no surprise prompt)."""
+        printer = SimPrinter(214., 0.39, speed=300., watts=SLOW_WATTS)
+        with tempfile.TemporaryDirectory() as tmp:
+            s, out = run(printer, tmp)
+            self.assertIsInstance(s, calibrate.Session, out)
+            times = [t + s.a.entry_delay for t, _ in s.readings]
+            for i, t in enumerate(times):
+                self.assertAlmostEqual(t, 180 * (i + 1), delta=15, msg=out)
+            self.assertGreaterEqual(len(s.readings), 5)
+            self.assertIn('next reading at 3:00', out)
+            self.assertIn('get ready — reading at', out)
+            self.assertNotIn('Final reading', out)
+            self.assertIn('calibration complete', out)
+            tau = float(out.split('Recommended:  time_constant')[1].split()[0])
+            self.assertAlmostEqual(tau, 214., delta=15., msg=out)
 
     def test_external_heater_off_aborts(self):
         """Idle timeout fires because SET_IDLE_TIMEOUT is dropped: run aborts

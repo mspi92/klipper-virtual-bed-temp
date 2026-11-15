@@ -99,14 +99,22 @@ Status fields (`printer.virtual_bed_temp`): `temperature`, `time_constant`, `los
 
 ## Calibration
 
-One heat-up of about 30 minutes, no extra sensor needed.
+One heat-up of about 15–20 minutes, plus a handheld IR thermometer. No extra sensor needed.
 
-**How it works.** Once the pad reaches its target, the heater only has to replace the heat flowing
-into the plate, plus some losses that stay roughly constant. That flow shrinks as the plate catches
-up, so the heater power fades at exactly the plate's rate:
-`P(t) ≈ P_steady + A·e^(−t/τ)`. Moonraker logs the power once per second, so `tools/fit_tau.py`
-can get τ from that log. No heater wattage or plate mass is needed. Two IR readings then pin down
-`loss` and serve as a cross-check.
+**How it works.** Two independent sources:
+- **Heater power.** Once the pad reaches its target, the heater only has to replace the heat flowing
+  into the plate, plus some losses that stay roughly constant. That flow shrinks as the plate
+  catches up, so in theory the heater power fades at exactly the plate's rate,
+  `P(t) ≈ P_steady + A·e^(−t/τ)`. Moonraker logs the power once per second, and no heater wattage
+  or plate mass is needed.
+- **IR readings** of the plate surface. They give `loss` and an independent estimate of the rate.
+
+When the two agree, the rate comes from the power and `loss` from the readings. On a real Voron
+whose heater is limited by `max_power: 0.6`, the pad took 5–6 minutes to reach its target. That
+left only a short, noisy power decay, and two runs on the same plate gave rates of 188 s and 278 s.
+The IR readings agreed between those runs (156 s and 160 s). So when power and readings disagree by
+more than 25 % and there are at least 3 readings, the result comes from the readings alone, and the
+script says so.
 
 ### Interactive (recommended): `tools/calibrate.py`
 
@@ -122,13 +130,16 @@ What it does:
 - Asks for a first IR reading as the starting value, then starts heating with `M140 S80`.
 - Records bed temperature and heater power itself, once per second. No Moonraker history settings
   are needed.
-- Beeps every 5 minutes and asks for an IR reading of the plate. Type the number and press Enter.
-  The reading is dated 10 s before you pressed Enter, to allow for walking back to the keyboard.
-- After each reading, shows how far the currently configured model is off and a preliminary fit.
-- Finishes once there is enough data: at least 15 min, at least 2 readings, and power data covering
-  1.25 plate time constants. That is about 15–20 min for typical beds; in simulations, recording
-  longer didn't improve accuracy. Then it prints the recommended values and the change from your current config.
-  Optionally it applies them to the running Klipper with `SET_VIRTUAL_BED_TEMP` for testing.
+- Asks for an IR reading of the plate every 3 minutes, at fixed run times (3:00, 6:00, 9:00, …).
+  Before each one it tells you when the next reading is due, both as run time and as clock time.
+  It beeps 30 s before and again when it's time. Type the number and press Enter; the reading is
+  dated 10 s before you pressed Enter, to allow for walking back to the keyboard.
+- After each reading, shows how far the currently configured model is off and a preliminary fit,
+  including which data it came from.
+- Finishes at a scheduled reading once there is enough data: at least 15 min, at least 3 readings,
+  and power data covering 1.25 plate time constants. That is about 15–20 min for typical beds.
+  Then it prints the recommended values, what they're based on, and the change from your current
+  config. Optionally it applies them to the running Klipper with `SET_VIRTUAL_BED_TEMP` for testing.
 - Saves the session as `~/calib-<date>.json/.csv`, which `fit_tau.py --load … --csv …` can re-fit.
 
 While it's waiting, press Enter for a menu: extra reading, finish now, or abort. Ctrl-C or a dropped
@@ -153,19 +164,21 @@ temperature_store_size: 3600   # seconds of history
 1. **Start at equilibrium.** Leave the bed off for at least 1 h so pad and plate are at room temperature.
 2. Send `M140 S80` and start a stopwatch at the same moment. A large temperature step gives
    the best resolution.
-3. Take two IR thermometer readings of the plate surface, near the centre:
-   - one at about **7 min**, while the plate is still clearly rising;
-   - one at about **15–20 min**, when the plate is close to settled.
+3. Take an IR thermometer reading of the plate surface near the centre every 3 minutes
+   (3, 6, 9, 12, 15 min). At least 3 readings are needed for the fallback to readings alone.
 
    Measure on the PEI sheet (emissivity ≈ 0.9). Bare aluminium reflects too much for IR to read
-   correctly. Hold the thermometer the same way both times.
-4. Wait until at least 20 minutes have passed, with nothing else heating or moving.
+   correctly. Hold the thermometer the same way each time.
+4. Wait until at least 15–20 minutes have passed, with nothing else heating or moving.
 
 Write the readings to `ir.csv` as `seconds_since_M140,temp`:
 
 ```
-420,51.5
-1100,70.5
+180,38.5
+360,52.0
+540,58.9
+720,62.1
+900,63.6
 ```
 
 #### 3. Fit
@@ -192,11 +205,11 @@ period after the pad first reaches its target.
 Put the values in your config and restart Klipper. On a later cold heat-up to a different
 target (e.g. 60 °C), compare an IR reading with the `virtual_bed_temp` value in Mainsail.
 
-**Accuracy.** The plate's rate comes from 10+ minutes of power data, so IR timing and reading
-errors hardly affect it. In simulations with a noisy controller and IR readings off by ±0.6 °C,
-the tool recovered `time_constant` within 1 % and `loss` within 0.003
-(see `tests/`). The weakest link is the IR thermometer's
-absolute accuracy, which mainly affects `loss`.
+**Accuracy.** In simulations with a noisy controller and IR readings off by ±1 °C, the tool
+recovered `time_constant` within about 5 % (see `tests/`). Real hardware is less ideal. On the
+Voron above, two runs fitted from readings alone agreed within 2 %, and the model matched all six
+readings to within 0.7 °C rms. The weakest link is the IR thermometer's absolute accuracy, which
+mainly affects `loss`.
 
 **Other reference sensors.** A thermistor taped to the plate and declared as
 `[temperature_sensor …]` also works: use `--ref "temperature_sensor plate_ref"` instead of `--csv`.

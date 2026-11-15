@@ -3,12 +3,14 @@
 
 Guides one cold heat-up: checks the printer via Moonraker, starts the bed
 heater, samples heater temperature/power at 1 Hz in the background and asks
-for an IR reading of the plate every --interval seconds. A reading is
-timestamped --entry-delay seconds before it was entered. After each reading
-it shows how far the configured model is off and a preliminary fit; at the
-end it recommends time_constant/loss (fit_tau.analyze: heater power decay +
-readings), optionally applies them with SET_VIRTUAL_BED_TEMP, and saves the
-session for fit_tau.py --load.
+for an IR reading of the plate every --interval seconds, announcing each
+reading's run time and wall-clock time in advance with a notice 30 s before.
+A reading is timestamped --entry-delay seconds before it was entered. After
+each reading it shows how far the configured model is off and a preliminary
+fit; at the end it recommends time_constant/loss (fit_tau.analyze: heater
+power decay + readings, or readings alone when they disagree), optionally
+applies them with SET_VIRTUAL_BED_TEMP, and saves the session for
+fit_tau.py --load.
 
 Meant to run on the Klipper host (default Moonraker URL localhost:7125).
 While waiting, press Enter for a menu (extra reading, finish, abort).
@@ -32,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fit_tau  # noqa: E402
 
 MODEL = 'virtual_bed_temp'
+READY_NOTICE = 30.  # s before a scheduled reading the user is alerted
 
 
 class Moonraker:
@@ -313,28 +316,42 @@ class Session:
         self.b.gcode('M140 S%.0f' % a.target)
         self.t0 = self.b.now()
         self.heating = True
-        self.say('heating started — next reading at %s (Enter for menu)'
+        self.say('heating started — readings every %s; Enter for menu'
                  % fmt_t(a.interval))
+        self.announce(a.interval, 0.)
 
     def run(self):
         self._measure()
         # last sample already recorded, so later analyses see identical data
         self.t_end = self.rec.last()[0]
 
+    def announce(self, next_prompt, el):
+        """Tell the user when the next reading is due: run time, wall clock."""
+        wait = max(next_prompt - el, 0.)
+        self.say('  next reading at %s (%s, in %s)'
+                 % (fmt_t(next_prompt),
+                    time.strftime('%H:%M:%S', time.localtime(time.time() + wait)),
+                    fmt_t(wait)))
+
     def _measure(self):
+        """Readings on a fixed grid (interval, 2·interval, …) so the user can
+        plan ahead; a ready notice READY_NOTICE s before each. The run ends
+        after a scheduled reading once finished() agrees, at max_duration,
+        or on q/f."""
         a = self.a
         next_prompt = a.interval
+        noticed = False
         last_status = -1e9
         while True:
             el = self.b.now() - self.t0
-            done, why = self.finished(el)
-            if done:
-                self.say('\n' + why)
-                v = read_temp('Final reading now (°C, Enter to skip): ',
-                              self.auto_reading())
-                if isinstance(v, float):
-                    self.add_reading(v)
+            if el >= a.max_duration:
+                self.say('\nmaximum duration reached.')
                 return
+            if not noticed and next_prompt - el <= READY_NOTICE:
+                print('\a', end='')
+                self.say('  get ready — reading at %s, in %s'
+                         % (fmt_t(next_prompt), fmt_t(max(next_prompt - el, 0.))))
+                noticed = True
             if el >= next_prompt:
                 print('\a', end='')
                 v = read_temp('\n[%s] Measure the plate now (°C, Enter to skip, '
@@ -343,7 +360,17 @@ class Session:
                     return
                 if isinstance(v, float):
                     self.add_reading(v)
-                next_prompt = (self.b.now() - self.t0) + a.interval
+                el = self.b.now() - self.t0
+                done, why = self.finished(el)
+                if done:
+                    self.say('\n' + why)
+                    return
+                # stay on the grid; skip a slot if the answer came very late
+                next_prompt += a.interval
+                while next_prompt - el < READY_NOTICE * 2:
+                    next_prompt += a.interval
+                noticed = False
+                self.announce(next_prompt, el)
             elif enter_pressed():
                 c = ask('\n[r] extra reading  [f] finish now  [a] abort  '
                         '[Enter] continue: ').strip().lower()
@@ -367,8 +394,9 @@ class Session:
                 s = self.rec.last()
                 if s:
                     model = '' if s[4] is None else '  model %.1f' % s[4]
-                    print('  %s  pad %.1f/%.0f  power %3.0f%%%s'
-                          % (fmt_t(el), s[1], s[2], s[3] * 100, model))
+                    print('  %s  pad %.1f/%.0f  power %3.0f%%%s  next reading in %s'
+                          % (fmt_t(el), s[1], s[2], s[3] * 100, model,
+                             fmt_t(max(next_prompt - el, 0.))))
                 last_status = el
             self.b.sleep(0.5)
 
@@ -379,10 +407,13 @@ class Session:
         if el < a.min_duration:
             return False, ''
         r = self.analyze(quiet=True)
+        # enough readings for the readings-only fallback in fit_tau.analyze
         need = fit_tau.MIN_POWER_SPANS * (r['tau_eff'] if r else 0.)
-        if r and r['power_s'] >= need and len(self.readings) >= 2:
-            return True, 'enough data recorded (%.0f s of power ≥ %.0f s needed).' % (
-                r['power_s'], need)
+        if (r and r['power_s'] >= need
+                and len(self.readings) >= fit_tau.MIN_READINGS_ALONE):
+            return True, ('calibration complete: %d readings, %.0f s of heater '
+                          'power (≥ %.0f s needed).'
+                          % (len(self.readings), r['power_s'], need))
         return False, ''
 
     # --- data -----------------------------------------------------------
@@ -402,9 +433,9 @@ class Session:
         self.say(line)
         r = self.analyze(quiet=True)
         if r:
-            self.say('  preliminary: time_constant ≈ %.0f, loss ≈ %.3f '
+            self.say('  preliminary: time_constant ≈ %.0f, loss ≈ %.3f from %s '
                      '(%.0f s power data, want ≥ %.0f)'
-                     % (r['tau'], r['loss'], r['power_s'],
+                     % (r['tau'], r['loss'], r['source'], r['power_s'],
                         fit_tau.MIN_POWER_SPANS * r['tau_eff']))
 
     def analyze(self, quiet=False):
@@ -435,6 +466,10 @@ class Session:
                      % r['free'][:2])
         for w in r['warnings']:
             self.say('warning:     ' + w)
+        self.say('result from: ' + {
+            'power+readings': 'heater power (rate) + readings (loss)',
+            'readings': 'IR readings alone',
+            'power': 'heater power alone (loss 0)'}[r['source']])
         self.say('', 'Recommended:  time_constant %.0f   loss %.3f   ambient_temp %.0f'
                  % (tau, loss, self.t_init))
         if self.model_cfg:
@@ -504,8 +539,8 @@ def build_parser():
     ap.add_argument('--moonraker', default='http://localhost:7125', metavar='URL')
     ap.add_argument('--heater', default='heater_bed')
     ap.add_argument('--target', type=float, default=80., help='bed target °C (default 80)')
-    ap.add_argument('--interval', type=int, default=300,
-                    help='seconds between reading prompts (default 300)')
+    ap.add_argument('--interval', type=int, default=180,
+                    help='seconds between reading prompts (default 180)')
     ap.add_argument('--entry-delay', type=int, default=10,
                     help='a reading is dated this many s before Enter (default 10)')
     ap.add_argument('--min-duration', type=int, default=900, help='s (default 900)')

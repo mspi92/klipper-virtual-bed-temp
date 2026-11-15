@@ -12,6 +12,9 @@ import time
 
 C_PLATE, C_PAD = 2500., 150.  # J/K
 WATTS, MAX_POWER = 750., 0.6
+# Heater that stays power-limited ~5 min (pad reaches 80 °C at ~325 s with
+# tau 214, loss 0.39): matches a measured Voron with max_power 0.6
+SLOW_WATTS = 600.
 H_PAD = 0.5                   # W/K pad underside loss
 KP, KI = 0.08, 0.004          # PI gains, PWM per °C (per °C·s)
 SENSOR_NOISE = 0.15           # °C, gaussian
@@ -20,7 +23,8 @@ SENSOR_NOISE = 0.15           # °C, gaussian
 class BedPhysics:
     """One-second steps of pad/plate temperatures under a PI loop."""
 
-    def __init__(self, tau, loss, ambient=22., seed=1):
+    def __init__(self, tau, loss, ambient=22., seed=1, watts=WATTS):
+        self.watts = watts
         self.g = C_PLATE / tau
         self.h = loss * self.g
         self.ambient = ambient
@@ -40,15 +44,16 @@ class BedPhysics:
         else:
             self.pwm = 0.
         q = self.g * (self.t_pad - self.t_plate)
-        self.t_pad += (self.pwm * WATTS - q
+        self.t_pad += (self.pwm * self.watts - q
                        - H_PAD * (self.t_pad - self.ambient)) / C_PAD
         self.t_plate += (q - self.h * (self.t_plate - self.ambient)) / C_PLATE
 
 
-def synthetic(tau, loss, ambient=22., target=80., n=1500, lead=100):
+def synthetic(tau, loss, ambient=22., target=80., n=1500, lead=100,
+              watts=WATTS):
     """Moonraker-temperature-store-shaped heat-up: target set at sample
     `lead`; true plate trace under 'temperature_sensor plate_ref'."""
-    bed = BedPhysics(tau, loss, ambient)
+    bed = BedPhysics(tau, loss, ambient, watts=watts)
     temps, targets, powers, plate = [], [], [], []
     for i in range(n):
         bed.target = target if i >= lead else 0.
@@ -69,8 +74,9 @@ class SimPrinter:
     [idle_timeout]: heater off after idle_timeout s without a G-code command;
     SET_IDLE_TIMEOUT supported. ignore: G-code commands silently dropped."""
 
-    def __init__(self, tau, loss, speed=200., ambient=22., ignore=()):
-        self.bed = BedPhysics(tau, loss, ambient, seed=2)
+    def __init__(self, tau, loss, speed=200., ambient=22., ignore=(),
+                 watts=WATTS):
+        self.bed = BedPhysics(tau, loss, ambient, seed=2, watts=watts)
         self.speed, self.ambient, self.ignore = speed, ambient, set(ignore)
         self.model = ambient
         self.model_tau, self.model_loss = 300., 0.

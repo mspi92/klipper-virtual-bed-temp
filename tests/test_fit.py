@@ -11,7 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'tools'))
 sys.path.insert(0, HERE)
 import fit_tau  # noqa: E402
-from sim import synthetic  # noqa: E402
+from sim import SLOW_WATTS, synthetic  # noqa: E402
 
 LEAD = 100
 
@@ -66,12 +66,33 @@ class WithReadings(unittest.TestCase):
         self.assertAlmostEqual(r['tau'], tau, delta=0.05 * tau)
         self.assertFalse(any('upper bound' in w for w in r['warnings']))
 
-    def test_cross_check_warns_on_bad_timing(self):
-        pad, pw, true = heatup(450., 0.02, 20)
-        # readings attributed to twice their real time: plate looks much slower
-        ref = [(2 * t, true[t]) for t in (150, 300, 450, 600)]
+    def test_misleading_power_falls_back_to_readings(self):
+        """Power decay from a slower plate (a real printer's power misjudged
+        the rate by ~80 % between runs) with readings of the true plate:
+        >= 3 readings override the power rate."""
+        tau, loss = 214., 0.39
+        pad, _, true = heatup(tau, loss, 16)
+        _, pw_slow, _ = heatup(400., loss, 16)
+        ref = [(t, true[t]) for t in (180, 360, 540, 720, 900)]
+        r = fit_tau.analyze(pad, pw_slow, 80., ref, 22., 22.)
+        self.assertEqual(r['source'], 'readings', r['warnings'])
+        self.assertAlmostEqual(r['tau'], tau, delta=0.05 * tau)
+        self.assertAlmostEqual(r['loss'], loss, delta=0.03)
+        # two readings are not enough to override: warn, keep power rate
+        r2 = fit_tau.analyze(pad, pw_slow, 80., ref[1::3], 22., 22.)
+        self.assertEqual(r2['source'], 'power+readings')
+        self.assertTrue(any('take >= 3' in w for w in r2['warnings']), r2['warnings'])
+
+    def test_slow_power_limited_pad(self):
+        """Pad stuck at max_power for ~5 min (measured printer)."""
+        d = synthetic(214., 0.39, n=LEAD + 16 * 60, lead=LEAD, watts=SLOW_WATTS)
+        pad = d['heater_bed']['temperatures'][LEAD:]
+        pw = d['heater_bed']['powers'][LEAD:]
+        true = d['temperature_sensor plate_ref']['temperatures'][LEAD:]
+        self.assertGreater(fit_tau.first_reached(pad, 80.), 270)
+        ref = [(t, true[t]) for t in (180, 360, 540, 720, 900)]
         r = fit_tau.analyze(pad, pw, 80., ref, 22., 22.)
-        self.assertTrue(any('disagree' in w for w in r['warnings']), r['warnings'])
+        self.assertAlmostEqual(r['tau'], 214., delta=0.05 * 214)
 
 
 class Helpers(unittest.TestCase):

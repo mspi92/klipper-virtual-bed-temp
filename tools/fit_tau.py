@@ -40,6 +40,9 @@ TAU_RANGE = (20., 5000.)
 # Power data needed, in plate time constants: Monte-Carlo (IR sigma 1 °C)
 # showed no accuracy gain beyond ~1.25 (≈ 15 min for a 450 s plate)
 MIN_POWER_SPANS = 1.25
+# Readings needed before a readings-only fit (2 parameters) may override
+# the power-based rate
+MIN_READINGS_ALONE = 3
 
 
 def fetch_store(url):
@@ -136,16 +139,23 @@ def fit_loss_constrained(heater, ref, t_init, ambient, tau_eff):
 
 
 def fit_free(heater, ref, t_init, ambient, fit_loss=True):
-    """Best (tau, loss, rms) from plate readings alone."""
-    best = None
-    for loss in (LOSS_GRID_COARSE if fit_loss else [0.]):
-        def err(tau):
-            return rms(simulate(heater, tau, loss, t_init, ambient), ref)
-        tau = golden(err, *TAU_RANGE)
-        e = err(tau)
-        if best is None or e < best[2]:
-            best = (tau, loss, e)
-    return best
+    """Best (tau, loss, rms) from plate readings alone: coarse loss grid,
+    then 0.002 steps within ±0.02 of the coarse optimum."""
+    def best_over(losses):
+        best = None
+        for loss in losses:
+            def err(tau):
+                return rms(simulate(heater, tau, loss, t_init, ambient), ref)
+            tau = golden(err, *TAU_RANGE)
+            e = err(tau)
+            if best is None or e < best[2]:
+                best = (tau, loss, e)
+        return best
+    if not fit_loss:
+        return best_over([0.])
+    coarse = best_over(LOSS_GRID_COARSE)
+    fine = [l for l in LOSS_GRID if abs(l - coarse[1]) <= 0.02 + 1e-9]
+    return best_over(fine)
 
 
 def analyze(heater, power, target, ref, t_init, ambient, skip=120,
@@ -154,10 +164,15 @@ def analyze(heater, power, target, ref, t_init, ambient, skip=120,
 
     heater, power: 1 Hz pad temperature / heater PWM, index 0 = target set.
     ref: plate readings [(index, temp)], may be empty.
+    Result source: 'power+readings' (rate from power, loss from readings);
+    'readings' when >= MIN_READINGS_ALONE readings disagree with the power
+    rate by > 25 % — a heater limited by max_power leaves a short, PID-shaped
+    power decay that misjudges the rate, while readings stay consistent;
+    'power' without readings (loss 0).
     Returns dict: reached (s until pad hit target), power_s (s of power data
-    fitted), tau_eff, p_steady, amp, p_rms, tau, loss, ref_rms (None without
-    readings), free ((tau, loss, rms) from readings alone, None with < 2
-    readings or fit_loss off), warnings [str].
+    fitted), tau_eff, p_steady, amp, p_rms, tau, loss, source, ref_rms (None
+    without readings), free ((tau, loss, rms) from readings alone, None with
+    < 2 readings or fit_loss off), warnings [str].
     Raises ValueError when the record is too short to fit.
     """
     warnings = []
@@ -178,27 +193,37 @@ def analyze(heater, power, target, ref, t_init, ambient, skip=120,
                         % MIN_POWER_SPANS)
     ref = [(i, t) for i, t in ref if 0 < i < len(heater)]
     free = None
+    source = 'power'
     if ref and fit_loss:
+        source = 'power+readings'
         tau, loss, ref_rms = fit_loss_constrained(heater, ref, t_init,
                                                   ambient, tau_eff)
-        if loss >= LOSS_GRID[-1]:
-            warnings.append('loss hit its upper bound — readings far below'
-                            ' the pad; check IR emissivity / timing')
         if len(ref) >= 2:
             free = fit_free(heater, ref, t_init, ambient)
             k_free = free[0] / (1 + free[1])
             if abs(k_free - tau_eff) / tau_eff > 0.25:
-                warnings.append(
-                    'readings and power disagree by > 25 %% on the plate rate'
-                    ' (%.0f s vs %.0f s); recheck reading times'
-                    % (k_free, tau_eff))
+                if len(ref) >= MIN_READINGS_ALONE:
+                    tau, loss, ref_rms = free
+                    source = 'readings'
+                    warnings.append(
+                        'readings and power disagree by > 25 %% on the plate'
+                        ' rate (%.0f s vs %.0f s); using the readings-only fit'
+                        % (k_free, tau_eff))
+                else:
+                    warnings.append(
+                        'readings and power disagree by > 25 %% on the plate'
+                        ' rate (%.0f s vs %.0f s); take >= %d readings to'
+                        ' decide' % (k_free, tau_eff, MIN_READINGS_ALONE))
+        if loss >= LOSS_GRID[-1]:
+            warnings.append('loss hit its upper bound — readings far below'
+                            ' the pad; check IR emissivity / timing')
     else:
         tau, loss = tau_eff, 0.
         ref_rms = (rms(simulate(heater, tau, 0., t_init, ambient), ref)
                    if ref else None)
     return {'reached': reached, 'power_s': len(power), 'tau_eff': tau_eff,
             'p_steady': p_ss, 'amp': amp, 'p_rms': p_rms, 'tau': tau,
-            'loss': loss, 'ref_rms': ref_rms, 'free': free,
+            'loss': loss, 'source': source, 'ref_rms': ref_rms, 'free': free,
             'warnings': warnings}
 
 
@@ -327,6 +352,7 @@ def main():
               ' (rms %.2f °C)' % r['free'])
     for w in r['warnings']:
         print('warning: ' + w)
+    print('result from:   %s' % r['source'])
 
     print('\nstart temp:    %.1f °C   ambient: %.1f °C' % (t_init, ambient))
     print('time_constant: %.0f' % tau)
