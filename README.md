@@ -37,7 +37,7 @@ cooling down, use `SET_VIRTUAL_BED_TEMP TEMP=` to correct it.
 
 ```bash
 cd ~
-git clone https://github.com/<github-user>/klipper-virtual-bed-temp.git
+git clone https://github.com/mspi92/klipper-virtual-bed-temp.git
 ~/klipper-virtual-bed-temp/install.sh
 ```
 
@@ -54,7 +54,7 @@ Add to `moonraker.conf` (see `examples/moonraker.conf`):
 [update_manager klipper-virtual-bed-temp]
 type: git_repo
 path: ~/klipper-virtual-bed-temp
-origin: https://github.com/<github-user>/klipper-virtual-bed-temp.git
+origin: https://github.com/mspi92/klipper-virtual-bed-temp.git
 primary_branch: main
 managed_services: klipper
 install_script: install.sh
@@ -134,8 +134,7 @@ What it does:
 While it's waiting, press Enter for a menu: extra reading, finish now, or abort. Ctrl-C or a dropped
 SSH connection turns the bed heater off and saves the data so far.
 Options: `--target`, `--interval`, `--entry-delay`, `--min-duration`, `--moonraker`
-(default `http://localhost:7125`). Try it without a printer:
-`calibrate.py --simulate 500 0.03 --sim-auto --speed 120`.
+(default `http://localhost:7125`).
 
 ### Manual: record, then `tools/fit_tau.py`
 
@@ -196,7 +195,7 @@ target (e.g. 60 °C), compare an IR reading with the `virtual_bed_temp` value in
 **Accuracy.** The plate's rate comes from 10+ minutes of power data, so IR timing and reading
 errors hardly affect it. In simulations with a noisy controller and IR readings off by ±0.6 °C,
 the tool recovered `time_constant` within 1 % and `loss` within 0.003
-(`tools/fit_tau.py --selftest TAU LOSS [--csv …]`). The weakest link is the IR thermometer's
+(see `tests/`). The weakest link is the IR thermometer's
 absolute accuracy, which mainly affects `loss`.
 
 **Other reference sensors.** A thermistor taped to the plate and declared as
@@ -206,6 +205,22 @@ absolute accuracy, which mainly affects `loss`.
 tiny area. The heater block is a large mass that also loses heat to the air, the heat break and
 the fans, so it reads many degrees low and adds its own lag. The resulting `time_constant` would
 be wrong.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The tests need only the Python standard library, with no Klipper checkout or printer.
+`tests/sim.py` simulates a heated bed with two parts, the heater pad and the plate, each with its
+own heat capacity, and a noisy PI temperature controller. The model under test only describes the
+plate, so these tests check the calibration method against physics it doesn't assume.
+- `test_fit.py`: fitting accuracy with noisy IR readings, the cross-check warning, and the CLI.
+- `test_calibrate.py`: `calibrate.py` end to end against a time-accelerated simulated printer,
+  including idle-timeout handling and aborting.
+- `test_module.py`: the Klipper module, with stand-ins for Klipper's printer, reactor, heater and
+  G-code objects.
 
 ## License
 

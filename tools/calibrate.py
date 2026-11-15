@@ -15,16 +15,11 @@ While waiting, press Enter for a menu (extra reading, finish, abort).
 Ctrl-C or a lost SSH session (SIGHUP/SIGTERM) aborts: bed heater off, data
 saved to --save-dir (default ~, outside the plugin's git checkout).
 
---simulate TAU LOSS replaces the printer with a time-accelerated two-node
-pad/plate simulation (fit_tau.synthetic physics); --sim-auto also answers
-the reading prompts with the simulated plate temperature ± 0.5 °C.
-
 Stdlib only, POSIX terminal (uses select on stdin).
 """
 import argparse
 import json
 import os
-import random
 import select
 import signal
 import sys
@@ -40,7 +35,10 @@ MODEL = 'virtual_bed_temp'
 
 
 class Moonraker:
-    """Minimal Moonraker HTTP client; times from time.monotonic()."""
+    """Minimal Moonraker HTTP client; times from time.monotonic().
+
+    Backend interface used by Session/Recorder: info(), objects(),
+    query(objects), gcode(script), now(), sleep(s)."""
 
     def __init__(self, url):
         self.url = url.rstrip('/')
@@ -71,96 +69,6 @@ class Moonraker:
 
     def sleep(self, s):
         time.sleep(s)
-
-
-class SimPrinter:
-    """Two-node pad/plate printer behind the Moonraker interface, running
-    `speed` times faster than real time. Physics as fit_tau.synthetic; a
-    virtual_bed_temp model with time_constant 300, loss 0 runs alongside.
-    Emulates [idle_timeout] (300 s, turns the heater off after that long
-    without a G-code command; SET_IDLE_TIMEOUT supported)."""
-
-    def __init__(self, tau, loss, speed, ambient=22.):
-        self.speed, self.ambient = speed, ambient
-        self.c_plate, self.c_pad, self.watts, self.max_power = 2500., 150., 750., 0.6
-        self.g = self.c_plate / tau
-        self.h = loss * self.g
-        self.t_pad = self.t_plate = self.model = ambient
-        self.model_tau, self.model_loss = 300., 0.
-        self.target = self.pwm = self.integ = 0.
-        self.measured = ambient
-        self.rng = random.Random(2)
-        self.t0_real = time.monotonic()
-        self.sim_t = 0.
-        self.idle_timeout, self.last_gcode = 300., 0.
-        self.lock = threading.Lock()
-
-    def _advance(self):
-        goal = (time.monotonic() - self.t0_real) * self.speed
-        while self.sim_t + 1. <= goal:
-            self.sim_t += 1.
-            if self.target and self.sim_t - self.last_gcode > self.idle_timeout:
-                self.target = 0.
-            self.measured = self.t_pad + self.rng.gauss(0., 0.15)
-            if self.target:
-                err = self.target - self.measured
-                u = 0.08 * err + self.integ
-                if 0. < u < self.max_power:
-                    self.integ += 0.004 * err
-                self.pwm = min(max(u, 0.), self.max_power)
-            else:
-                self.pwm = 0.
-            q = self.g * (self.t_pad - self.t_plate)
-            self.t_pad += (self.pwm * self.watts - q
-                           - 0.5 * (self.t_pad - self.ambient)) / self.c_pad
-            self.t_plate += (q - self.h * (self.t_plate - self.ambient)) / self.c_plate
-            self.model += ((self.measured - self.model)
-                           - self.model_loss * (self.model - self.ambient)) / self.model_tau
-
-    def info(self):
-        return {'state': 'ready'}
-
-    def objects(self):
-        return ['heater_bed', MODEL, 'print_stats']
-
-    def query(self, objects):
-        with self.lock:
-            self._advance()
-            return {'heater_bed': {'temperature': self.measured,
-                                   'target': self.target, 'power': self.pwm},
-                    MODEL: {'temperature': self.model,
-                            'time_constant': self.model_tau,
-                            'loss': self.model_loss},
-                    'print_stats': {'state': 'standby'},
-                    'idle_timeout': {'idle_timeout': self.idle_timeout}}
-
-    def gcode(self, script):
-        with self.lock:
-            self._advance()
-            self.last_gcode = self.sim_t
-            words = script.split()
-            if words[0] == 'M140':
-                self.target = float(words[1][1:])
-            elif words[0] == 'SET_IDLE_TIMEOUT':
-                self.idle_timeout = float(words[1].split('=')[1])
-            elif words[0] == 'SET_VIRTUAL_BED_TEMP':
-                for w in words[1:]:
-                    k, v = w.split('=')
-                    if k == 'TIME_CONSTANT':
-                        self.model_tau = float(v)
-                    elif k == 'LOSS':
-                        self.model_loss = float(v)
-
-    def plate_truth(self):
-        with self.lock:
-            self._advance()
-            return self.t_plate
-
-    def now(self):
-        return (time.monotonic() - self.t0_real) * self.speed
-
-    def sleep(self, s):
-        time.sleep(s / self.speed)
 
 
 class Recorder(threading.Thread):
@@ -291,11 +199,16 @@ def enter_pressed():
 
 
 class Session:
-    """One calibration run; see module docstring."""
+    """One calibration run; see module docstring.
 
-    def __init__(self, args, backend):
+    plate_reader: optional callable returning a plate temperature (°C); when
+    given, every prompt is answered automatically (readings from it, yes to
+    all questions) — for unattended runs against a simulated backend."""
+
+    def __init__(self, args, backend, plate_reader=None):
         self.a, self.b = args, backend
-        self.auto = args.sim_auto
+        self.plate_reader = plate_reader
+        self.auto = plate_reader is not None
         self.readings = []  # [(seconds since t0, temp)]
         self.t0 = None
         self.t_init = None
@@ -369,8 +282,8 @@ class Session:
         if abs(drift) > 0.5:
             self.say('warning: pad temperature drifting %.1f °C/min — bed not at '
                      'equilibrium, results will be off' % drift)
-        sim_truth = self.b.plate_truth() + 0.3 if self.auto else None
-        v = read_temp('Measure the plate now (°C, Enter to skip): ', sim_truth)
+        v = read_temp('Measure the plate now (°C, Enter to skip): ',
+                      self.auto_reading())
         pad_now = self.rec.last()[1]
         if isinstance(v, float):
             self.t_init = v
@@ -409,14 +322,14 @@ class Session:
             if done:
                 self.say('\n' + why)
                 v = read_temp('Final reading now (°C, Enter to skip): ',
-                              self.sim_reading())
+                              self.auto_reading())
                 if isinstance(v, float):
                     self.add_reading(v)
                 return
             if el >= next_prompt:
                 print('\a', end='')
                 v = read_temp('\n[%s] Measure the plate now (°C, Enter to skip, '
-                              'q to finish): ' % fmt_t(el), self.sim_reading())
+                              'q to finish): ' % fmt_t(el), self.auto_reading())
                 if v == 'q':
                     return
                 if isinstance(v, float):
@@ -464,10 +377,8 @@ class Session:
         return False, ''
 
     # --- data -----------------------------------------------------------
-    def sim_reading(self):
-        if not self.auto:
-            return None
-        return self.b.plate_truth() + random.uniform(-0.5, 0.5)
+    def auto_reading(self):
+        return self.plate_reader() if self.plate_reader else None
 
     def add_reading(self, v):
         t = self.b.now() - self.t0 - self.a.entry_delay
@@ -578,7 +489,7 @@ class Session:
         self.say('idle timeout restored to %.0f s' % self.idle_orig)
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--moonraker', default='http://localhost:7125', metavar='URL')
@@ -598,25 +509,13 @@ def main():
     ap.add_argument('--status-every', type=int, default=30,
                     help='status line interval, s (default 30)')
     ap.add_argument('--save-dir', default=os.path.expanduser('~'))
-    ap.add_argument('--simulate', nargs=2, type=float, metavar=('TAU', 'LOSS'))
-    ap.add_argument('--speed', type=float, default=60.,
-                    help='simulation speed-up (default 60)')
-    ap.add_argument('--sim-auto', action='store_true',
-                    help='with --simulate: answer all prompts automatically')
-    args = ap.parse_args()
-    if args.sim_auto and not args.simulate:
-        ap.error('--sim-auto needs --simulate')
+    return ap
 
-    def hangup(signum, frame):
-        # stdout may be gone with the terminal; abort path must not fail on print
-        sys.stdout = open(os.devnull, 'w')
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGHUP, hangup)
-    signal.signal(signal.SIGTERM, hangup)
 
-    backend = (SimPrinter(*args.simulate, speed=args.speed) if args.simulate
-               else Moonraker(args.moonraker))
-    s = Session(args, backend)
+def run_session(args, backend, plate_reader=None):
+    """Full calibration flow on backend; returns the Session.
+    Exits via SystemExit (status 1 on abort) like the CLI."""
+    s = Session(args, backend, plate_reader)
     try:
         s.preflight()
         s.intro()
@@ -642,6 +541,19 @@ def main():
             s.rec.stop()
         if s.rec and s.rec.errors:
             print('note: %d Moonraker polls failed during the run' % s.rec.errors)
+    return s
+
+
+def main():
+    args = build_parser().parse_args()
+
+    def hangup(signum, frame):
+        # stdout may be gone with the terminal; abort path must not fail on print
+        sys.stdout = open(os.devnull, 'w')
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGHUP, hangup)
+    signal.signal(signal.SIGTERM, hangup)
+    run_session(args, Moonraker(args.moonraker))
 
 
 if __name__ == '__main__':

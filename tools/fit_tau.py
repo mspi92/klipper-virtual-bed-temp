@@ -28,7 +28,6 @@ Stdlib only. Exit status 1 on missing/inconsistent data.
 import argparse
 import json
 import math
-import random
 import sys
 import urllib.request
 
@@ -240,54 +239,14 @@ def load_csv(path):
     return ref
 
 
-def synthetic(tau, loss, ambient=22., target=80., n=1500, lead=100,
-              watts=750., max_power=0.6, c_plate=2500., c_pad=150.):
-    """Store-shaped data from a two-node pad/plate simulation with a PI
-    controller on the pad thermistor; physics independent of the fitted model.
-    Plate: C dT/dt = G (T_pad - T) - h (T - T_amb), G = C/tau, h = loss*G.
-    Pad thermistor reading carries 0.15 °C gaussian noise (fixed seed), which
-    makes the controller's power noisy like a real PID.
-    Also returns the true plate trace under 'temperature_sensor plate_ref'."""
-    rng = random.Random(1)
-    g = c_plate / tau
-    h = loss * g
-    h_pad = 0.5  # W/K pad underside loss
-    t_pad = t_plate = ambient
-    integ = 0.
-    temps, targets, powers, plate = [], [], [], []
-    for i in range(n):
-        tgt = target if i >= lead else 0.
-        measured = t_pad + rng.gauss(0., 0.15)
-        if tgt:
-            err = tgt - measured
-            u = 0.08 * err + integ
-            if 0. < u < max_power:
-                integ += 0.004 * err * DT
-            pwm = min(max(u, 0.), max_power)
-        else:
-            pwm = 0.
-        q_pp = g * (t_pad - t_plate)
-        t_pad += (pwm * watts - q_pp - h_pad * (t_pad - ambient)) * DT / c_pad
-        t_plate += (q_pp - h * (t_plate - ambient)) * DT / c_plate
-        temps.append(measured)
-        targets.append(tgt)
-        powers.append(pwm)
-        plate.append(t_plate)
-    return {'heater_bed': {'temperatures': temps, 'targets': targets,
-                           'powers': powers},
-            'temperature_sensor plate_ref': {'temperatures': plate}}
-
-
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument('--moonraker', metavar='URL',
                      help='e.g. http://mainsailos.local:7125')
-    src.add_argument('--load', metavar='FILE', help='store JSON saved with --save')
-    src.add_argument('--selftest', nargs=2, type=float, metavar=('TAU', 'LOSS'),
-                     help='synthetic two-node heat-up with known TAU, LOSS; '
-                          'combine with --csv to test IR readings')
+    src.add_argument('--load', metavar='FILE',
+                     help='store JSON saved with --save or by calibrate.py')
     ap.add_argument('--save', metavar='FILE', help='write the store to FILE')
     ap.add_argument('--heater', default='heater_bed')
     ref_src = ap.add_mutually_exclusive_group()
@@ -304,12 +263,7 @@ def main():
                     help='WAIT_VIRTUAL_BED_TEMP margin for the soak table, °C')
     args = ap.parse_args()
 
-    if args.selftest:
-        store = synthetic(*args.selftest)
-        print('selftest truth: time_constant %.0f, loss %.3f, k-time %.0f s'
-              % (args.selftest[0], args.selftest[1],
-                 args.selftest[0] / (1 + args.selftest[1])))
-    elif args.load:
+    if args.load:
         with open(args.load) as f:
             store = json.load(f)
     else:
