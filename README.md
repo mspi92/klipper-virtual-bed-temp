@@ -108,7 +108,37 @@ up, so the heater power fades at exactly the plate's rate:
 can get τ from that log. No heater wattage or plate mass is needed. Two IR readings then pin down
 `loss` and serve as a cross-check.
 
-### 1. Prepare (once)
+### Interactive (recommended): `tools/calibrate.py`
+
+Run it on the Klipper host, i.e. the Pi, over SSH:
+
+```bash
+python3 ~/klipper-virtual-bed-temp/tools/calibrate.py
+```
+
+What it does:
+- Checks Klipper: it must be ready, not printing, with the bed heater off. It also checks that the bed
+  temperature is stable.
+- Asks for a first IR reading as the starting value, then starts heating with `M140 S80`.
+- Records bed temperature and heater power itself, once per second. No Moonraker history settings
+  are needed.
+- Beeps every 5 minutes and asks for an IR reading of the plate. Type the number and press Enter.
+  The reading is dated 10 s before you pressed Enter, to allow for walking back to the keyboard.
+- After each reading, shows how far the currently configured model is off and a preliminary fit.
+- Finishes once there is enough data (at least 25 min, and enough power data to cover the plate's
+  heat-up). Then it prints the recommended values and the change from your current config.
+  Optionally it applies them to the running Klipper with `SET_VIRTUAL_BED_TEMP` for testing.
+- Saves the session as `~/calib-<date>.json/.csv`, which `fit_tau.py --load … --csv …` can re-fit.
+
+While it's waiting, press Enter for a menu: extra reading, finish now, or abort. Ctrl-C or a dropped
+SSH connection turns the bed heater off and saves the data so far.
+Options: `--target`, `--interval`, `--entry-delay`, `--min-duration`, `--moonraker`
+(default `http://localhost:7125`). Try it without a printer:
+`calibrate.py --simulate 500 0.03 --sim-auto --speed 120`.
+
+### Manual: record, then `tools/fit_tau.py`
+
+#### 1. Prepare (once)
 
 The heat-up has to fit in Moonraker's temperature history, which is 20 minutes by default.
 Raise it in `moonraker.conf` and restart Moonraker:
@@ -118,7 +148,7 @@ Raise it in `moonraker.conf` and restart Moonraker:
 temperature_store_size: 3600   # seconds of history
 ```
 
-### 2. Record
+#### 2. Record
 
 1. **Start at equilibrium.** Leave the bed off for at least 1 h so pad and plate are at room temperature.
 2. Send `M140 S80` and start a stopwatch at the same moment. A large temperature step gives
@@ -138,7 +168,7 @@ Write the readings to `ir.csv` as `seconds_since_M140,temp`:
 1500,73.0
 ```
 
-### 3. Fit
+#### 3. Fit
 
 On any machine that can reach Moonraker:
 
@@ -157,7 +187,7 @@ Without `--csv`, the tool fits from power alone and uses `loss: 0`. Use `--load 
 re-run the fit on saved data. `--skip` (default 120 s) leaves out the controller's settling
 period after the pad first reaches its target.
 
-### 4. Check
+#### 4. Check
 
 Put the values in your config and restart Klipper. On a later cold heat-up to a different
 target (e.g. 60 °C), compare an IR reading with the `virtual_bed_temp` value in Mainsail.

@@ -143,6 +143,70 @@ def fit_free(heater, ref, t_init, ambient, fit_loss=True):
     return best
 
 
+def analyze(heater, power, target, ref, t_init, ambient, skip=120,
+            fit_loss=True):
+    """Two-stage calibration of one heat-up.
+
+    heater, power: 1 Hz pad temperature / heater PWM, index 0 = target set.
+    ref: plate readings [(index, temp)], may be empty.
+    Returns dict: reached (s until pad hit target), power_s (s of power data
+    fitted), tau_eff, p_steady, amp, p_rms, tau, loss, ref_rms (None without
+    readings), free ((tau, loss, rms) from readings alone, None with < 2
+    readings or fit_loss off), warnings [str].
+    Raises ValueError when the record is too short to fit.
+    """
+    warnings = []
+    reached = first_reached(heater, target)
+    if reached is None:
+        raise ValueError('pad has not reached its target %.1f °C yet' % target)
+    power = power[reached + skip:]
+    if len(power) < 120:
+        raise ValueError('only %d s of power data after pad reached target'
+                         ' + %d s settling' % (max(len(power), 0), skip))
+    tau_eff, p_ss, amp, p_rms = fit_power(power)
+    if amp <= 0:
+        warnings.append('power is not decaying — wrong window?'
+                        ' check --skip/--start-ago')
+    if len(power) * DT < 2.5 * tau_eff:
+        warnings.append('power record covers < 2.5 time constants'
+                        ' — rate still uncertain, record longer')
+    ref = [(i, t) for i, t in ref if 0 < i < len(heater)]
+    free = None
+    if ref and fit_loss:
+        tau, loss, ref_rms = fit_loss_constrained(heater, ref, t_init,
+                                                  ambient, tau_eff)
+        if loss >= LOSS_GRID[-1]:
+            warnings.append('loss hit its upper bound — readings far below'
+                            ' the pad; check IR emissivity / timing')
+        if len(ref) >= 2:
+            free = fit_free(heater, ref, t_init, ambient)
+            k_free = free[0] / (1 + free[1])
+            if abs(k_free - tau_eff) / tau_eff > 0.25:
+                warnings.append(
+                    'readings and power disagree by > 25 %% on the plate rate'
+                    ' (%.0f s vs %.0f s); recheck reading times'
+                    % (k_free, tau_eff))
+    else:
+        tau, loss = tau_eff, 0.
+        ref_rms = (rms(simulate(heater, tau, 0., t_init, ambient), ref)
+                   if ref else None)
+    return {'reached': reached, 'power_s': len(power), 'tau_eff': tau_eff,
+            'p_steady': p_ss, 'amp': amp, 'p_rms': p_rms, 'tau': tau,
+            'loss': loss, 'ref_rms': ref_rms, 'free': free,
+            'warnings': warnings}
+
+
+def soak_table(tau, loss, ambient, margin, targets=(60., 80., 100., 110.)):
+    """Lines describing plate steady state and soak time per bed target."""
+    lines = ['soak from %.0f °C until plate is within %.1f °C of steady state'
+             ' (ideal heater step):' % (ambient, margin)]
+    for tgt in targets:
+        t = time_to_reach(tgt, margin, tau, loss, ambient)
+        lines.append('  bed %5.0f °C: plate steady %5.1f °C, %4.1f min'
+                     % (tgt, steady_state(tgt, loss, ambient), t / 60))
+    return lines
+
+
 def steady_state(target, loss, ambient):
     """Plate equilibrium temperature for a heater held at target."""
     return (target + loss * ambient) / (1 + loss)
@@ -263,29 +327,11 @@ def main():
     heater = temps[start:]
     target = hs['targets'][start] if hs.get('targets') else max(heater)
 
-    # Stage 1: power decay
     if 'powers' not in hs:
         sys.exit('error: store has no heater powers')
-    reached = first_reached(heater, target)
-    if reached is None:
-        sys.exit('error: pad never reached its target %.1f in the record' % target)
-    p0 = reached + args.skip
-    power = hs['powers'][start + p0:]
-    if len(power) < 120:
-        sys.exit('error: only %d s of power data after pad reached target + skip'
-                 % len(power))
-    tau_eff, p_ss, amp, p_rms = fit_power(power)
-    print('heat-up:       target %.0f °C, pad reached it after %d s, '
-          'power fit over %d s' % (target, reached, len(power)))
-    print('power fit:     P = %.3f + %.3f·exp(−t/%.0f s), rms %.3f'
-          % (p_ss, amp, tau_eff, p_rms))
-    if amp <= 0:
-        print('warning: power is not decaying — wrong window? check --skip/--start-ago')
-    if len(power) * DT < 2.5 * tau_eff:
-        print('warning: power record covers < 2.5 time constants — record longer'
-              ' (raise temperature_store_size)')
+    power = hs['powers'][start:]
 
-    # Stage 2: plate readings; sample before the target rise is still at equilibrium
+    # Sample before the target rise is still at equilibrium
     t_init = temps[start - 1] if start > 0 else heater[0]
     ref = []
     if args.csv:
@@ -301,26 +347,25 @@ def main():
     ref = [(i, t) for i, t in ref if 0 < i < len(heater)]
     ambient = t_init if args.ambient is None else args.ambient
 
-    if ref and not args.no_loss:
-        tau, loss, err = fit_loss_constrained(heater, ref, t_init, ambient, tau_eff)
-        print('readings:      %d, rms vs model %.2f °C' % (len(ref), err))
-        if loss >= LOSS_GRID[-1]:
-            print('warning: loss hit its upper bound — readings far below the pad;'
-                  ' check IR emissivity / timing')
-        free = fit_free(heater, ref, t_init, ambient)
-        print('cross-check:   readings alone → time_constant %.0f, loss %.3f'
-              ' (rms %.2f °C)' % free)
-        k_free = free[0] / (1 + free[1])
-        if abs(k_free - tau_eff) / tau_eff > 0.25:
-            print('warning: readings and power disagree by > 25 %% on the plate '
-                  'rate (%.0f s vs %.0f s); recheck reading times' % (k_free, tau_eff))
+    try:
+        r = analyze(heater, power, target, ref, t_init, ambient, args.skip,
+                    not args.no_loss)
+    except ValueError as e:
+        sys.exit('error: %s' % e)
+    tau, loss = r['tau'], r['loss']
+    print('heat-up:       target %.0f °C, pad reached it after %d s, '
+          'power fit over %d s' % (target, r['reached'], r['power_s']))
+    print('power fit:     P = %.3f + %.3f·exp(−t/%.0f s), rms %.3f'
+          % (r['p_steady'], r['amp'], r['tau_eff'], r['p_rms']))
+    if r['ref_rms'] is None:
+        print('readings:      none — loss fixed at 0')
     else:
-        tau, loss = tau_eff, 0.
-        if ref:
-            print('readings:      %d, rms vs model %.2f °C'
-                  % (len(ref), rms(simulate(heater, tau, 0., t_init, ambient), ref)))
-        else:
-            print('readings:      none — loss fixed at 0')
+        print('readings:      %d, rms vs model %.2f °C' % (len(ref), r['ref_rms']))
+    if r['free']:
+        print('cross-check:   readings alone → time_constant %.0f, loss %.3f'
+              ' (rms %.2f °C)' % r['free'])
+    for w in r['warnings']:
+        print('warning: ' + w)
 
     print('\nstart temp:    %.1f °C   ambient: %.1f °C' % (t_init, ambient))
     print('time_constant: %.0f' % tau)
@@ -329,12 +374,8 @@ def main():
         if name.split()[0] == 'virtual_bed_temp' and ref:
             cur = store[name]['temperatures'][start:]
             print('current %s rms vs readings: %.2f °C' % (name, rms(cur, ref)))
-    print('\nsoak from %.0f °C until plate is within %.1f °C of steady state'
-          ' (ideal heater step):' % (ambient, args.margin))
-    for tgt in (60., 80., 100., 110.):
-        t = time_to_reach(tgt, args.margin, tau, loss, ambient)
-        print('  bed %5.0f °C: plate steady %5.1f °C, %4.1f min'
-              % (tgt, steady_state(tgt, loss, ambient), t / 60))
+    print()
+    print('\n'.join(soak_table(tau, loss, ambient, args.margin)))
     print('\n[virtual_bed_temp]\ntime_constant: %.0f\nloss: %.3f\nambient_temp: %.0f'
           % (tau, loss, ambient))
 
