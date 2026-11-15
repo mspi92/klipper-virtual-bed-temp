@@ -76,7 +76,9 @@ class Moonraker:
 class SimPrinter:
     """Two-node pad/plate printer behind the Moonraker interface, running
     `speed` times faster than real time. Physics as fit_tau.synthetic; a
-    virtual_bed_temp model with time_constant 300, loss 0 runs alongside."""
+    virtual_bed_temp model with time_constant 300, loss 0 runs alongside.
+    Emulates [idle_timeout] (300 s, turns the heater off after that long
+    without a G-code command; SET_IDLE_TIMEOUT supported)."""
 
     def __init__(self, tau, loss, speed, ambient=22.):
         self.speed, self.ambient = speed, ambient
@@ -90,12 +92,15 @@ class SimPrinter:
         self.rng = random.Random(2)
         self.t0_real = time.monotonic()
         self.sim_t = 0.
+        self.idle_timeout, self.last_gcode = 300., 0.
         self.lock = threading.Lock()
 
     def _advance(self):
         goal = (time.monotonic() - self.t0_real) * self.speed
         while self.sim_t + 1. <= goal:
             self.sim_t += 1.
+            if self.target and self.sim_t - self.last_gcode > self.idle_timeout:
+                self.target = 0.
             self.measured = self.t_pad + self.rng.gauss(0., 0.15)
             if self.target:
                 err = self.target - self.measured
@@ -126,14 +131,18 @@ class SimPrinter:
                     MODEL: {'temperature': self.model,
                             'time_constant': self.model_tau,
                             'loss': self.model_loss},
-                    'print_stats': {'state': 'standby'}}
+                    'print_stats': {'state': 'standby'},
+                    'idle_timeout': {'idle_timeout': self.idle_timeout}}
 
     def gcode(self, script):
         with self.lock:
             self._advance()
+            self.last_gcode = self.sim_t
             words = script.split()
             if words[0] == 'M140':
                 self.target = float(words[1][1:])
+            elif words[0] == 'SET_IDLE_TIMEOUT':
+                self.idle_timeout = float(words[1].split('=')[1])
             elif words[0] == 'SET_VIRTUAL_BED_TEMP':
                 for w in words[1:]:
                     k, v = w.split('=')
@@ -293,6 +302,8 @@ class Session:
         self.heating = False
         self.rec = None
         self.model_cfg = None
+        self.idle_orig = None  # configured idle timeout, s; None if unknown
+        self.idle_raised = False
 
     def say(self, *lines):
         print('\n'.join(lines))
@@ -307,13 +318,15 @@ class Session:
         if a.heater not in objs:
             sys.exit('%s not found in Klipper' % a.heater)
         has_model = MODEL in objs
-        q = {a.heater: None, 'print_stats': ['state']}
+        q = {a.heater: None, 'print_stats': ['state'],
+             'idle_timeout': ['idle_timeout']}
         if has_model:
             q[MODEL] = None
         st = b.query(q)
         if st.get('print_stats', {}).get('state') in ('printing', 'paused'):
             sys.exit('printer is %s — not calibrating' % st['print_stats']['state'])
         h = st[a.heater]
+        self.idle_orig = st.get('idle_timeout', {}).get('idle_timeout')
         if has_model:
             self.model_cfg = st[MODEL]
             self.say('configured model: time_constant %.0f, loss %.3f'
@@ -371,6 +384,15 @@ class Session:
         a = self.a
         if not self.auto:
             ask('\nPress Enter to start heating (sends M140 S%.0f) ' % a.target)
+        # [idle_timeout] would turn the heater off mid-run: nothing is sent
+        # to Klipper while waiting for readings
+        if self.idle_orig is not None:
+            run_timeout = a.max_duration + 1800
+            if self.idle_orig < run_timeout:
+                self.b.gcode('SET_IDLE_TIMEOUT TIMEOUT=%d' % run_timeout)
+                self.idle_raised = True
+                self.say('idle timeout raised %.0f → %d s for this run'
+                         % (self.idle_orig, run_timeout))
         self.b.gcode('M140 S%.0f' % a.target)
         self.t0 = self.b.now()
         self.heating = True
@@ -411,6 +433,14 @@ class Session:
                     return
                 elif c == 'a':
                     raise KeyboardInterrupt
+            s = self.rec.last()
+            if s and el > 5 and s[0] > self.t0 + 2 and s[2] != a.target:
+                self.say('\nerror: %s target changed to %.0f outside this script '
+                         '(idle timeout, macro or UI) — run invalid, aborting'
+                         % (a.heater, s[2]))
+                if s[2] <= 0:
+                    self.heating = False
+                raise KeyboardInterrupt
             if el - last_status >= a.status_every:
                 s = self.rec.last()
                 if s:
@@ -538,6 +568,13 @@ class Session:
             self.say('bed heater off.')
         self.heating = False
 
+    def restore_idle_timeout(self):
+        if not self.idle_raised:
+            return
+        self.b.gcode('SET_IDLE_TIMEOUT TIMEOUT=%.0f' % self.idle_orig)
+        self.idle_raised = False
+        self.say('idle timeout restored to %.0f s' % self.idle_orig)
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -594,6 +631,11 @@ def main():
             s.save()
         sys.exit(1)
     finally:
+        try:
+            s.restore_idle_timeout()
+        except Exception as e:
+            print('warning: could not restore idle timeout (%s) — '
+                  'run SET_IDLE_TIMEOUT TIMEOUT=%s' % (e, s.idle_orig))
         if s.rec:
             s.rec.stop()
         if s.rec and s.rec.errors:
