@@ -10,8 +10,8 @@ on a plate that is still cold and still expanding.
 
 This module adds a virtual temperature sensor, `virtual_bed_temp`, that models the plate's lag
 behind the pad. It shows up in Mainsail/Fluidd next to the other sensors and gives you a
-`WAIT_VIRTUAL_BED_TEMP` command for your start macro. No extra hardware is needed. Calibrating it
-once with a reference sensor is recommended.
+`WAIT_VIRTUAL_BED_TEMP` command for your start macro. No extra hardware is needed: calibration uses
+the bed heater's own power log plus two readings from a handheld IR thermometer.
 
 ## Model
 
@@ -99,44 +99,79 @@ Status fields (`printer.virtual_bed_temp`): `temperature`, `time_constant`, `los
 
 ## Calibration
 
-You need a reference measurement of the plate surface during one heat-up.
+One heat-up of about 30 minutes, no extra sensor needed.
+
+**How it works.** Once the pad reaches its target, the heater only has to replace the heat flowing
+into the plate, plus some losses that stay roughly constant. That flow shrinks as the plate catches
+up, so the heater power fades at exactly the plate's rate:
+`P(t) ≈ P_steady + A·e^(−t/τ)`. Moonraker logs the power once per second, so `tools/fit_tau.py`
+can get τ from that log. No heater wattage or plate mass is needed. Two IR readings then pin down
+`loss` and serve as a cross-check.
+
+### 1. Prepare (once)
+
+The heat-up has to fit in Moonraker's temperature history, which is 20 minutes by default.
+Raise it in `moonraker.conf` and restart Moonraker:
+
+```ini
+[data_store]
+temperature_store_size: 3600   # seconds of history
+```
+
+### 2. Record
 
 1. **Start at equilibrium.** Leave the bed off for at least 1 h so pad and plate are at room temperature.
-2. **Reference sensor (best):** tape a spare 100k NTC thermistor to the top of the plate with
-   Kapton tape and cover it with a bit of insulation. Connect it to a free thermistor input and
-   add it temporarily:
-   ```ini
-   [temperature_sensor plate_ref]
-   sensor_type: Generic 3950
-   sensor_pin: <free thermistor pin>
-   ```
-   Moonraker logs it once per second together with the bed.
-   **Fallback:** an IR thermometer on the plate surface every 60 s, written down as
-   `seconds_since_M140,temp` lines in a CSV file. IR readings work on PEI (emissivity ≈ 0.9) but
-   not on bare aluminium.
-3. **Heat:** `M140 S80`. A large step gives the best resolution. Wait about 25 minutes without
-   touching anything.
-4. **Fit**, on any machine that can reach Moonraker. Do this before Moonraker's 20-minute history
-   runs out, or increase `temperature_store_size` in its `[data_store]` section:
-   ```bash
-   python3 tools/fit_tau.py --moonraker http://<printer>:7125 --ref "temperature_sensor plate_ref" --save run1.json
-   # or with manual readings:
-   python3 tools/fit_tau.py --moonraker http://<printer>:7125 --csv ir.csv --save run1.json
-   ```
-   The tool runs the model over the actual recorded pad temperature and finds the best
-   `time_constant` and `loss`. It prints the RMS error, a ready-to-paste config section, and the
-   expected soak times. Pass `--no-loss` to fit `time_constant` only. Use `--load run1.json` to
-   re-run the fit on saved data.
-5. **Verify** with a second run at another target, e.g. 60 °C. With the new values in the config,
-   the tool also reports how far the running `virtual_bed_temp` is off from the reference.
-6. Remove `plate_ref`.
+2. Send `M140 S80` and start a stopwatch at the same moment. A large temperature step gives
+   the best resolution.
+3. Take two IR thermometer readings of the plate surface, near the centre:
+   - one at about **7 min**, while the plate is still clearly rising;
+   - one at about **25 min**, when the plate is nearly settled.
 
-**Quick estimate without the tool:** the pad reaches target much faster than the plate, so you can
-treat it as an instant step. One plate reading `T_plate` at time `t` then gives
-`time_constant ≈ (t − t_pad) / ln((T_set − T_start) / (T_set − T_plate))`,
-where `t_pad` is when the pad reached its target.
+   Measure on the PEI sheet (emissivity ≈ 0.9). Bare aluminium reflects too much for IR to read
+   correctly. Hold the thermometer the same way both times.
+4. Wait until at least 25 minutes have passed, with nothing else heating or moving.
 
-**Why not use the nozzle as the sensor?** A cold nozzle resting on the bed touches it over a
+Write the readings to `ir.csv` as `seconds_since_M140,temp`:
+
+```
+420,51.5
+1500,73.0
+```
+
+### 3. Fit
+
+On any machine that can reach Moonraker:
+
+```bash
+python3 tools/fit_tau.py --moonraker http://<printer>:7125 --csv ir.csv --save run1.json
+```
+
+The output includes:
+- the power fit (`P = … · exp(−t/τ)`);
+- how far the model is off from your readings (RMS);
+- a **cross-check** fitted from the readings alone, with a warning if it disagrees with the power
+  fit by more than 25 %;
+- a ready-to-paste `[virtual_bed_temp]` section and the expected soak times.
+
+Without `--csv`, the tool fits from power alone and uses `loss: 0`. Use `--load run1.json` to
+re-run the fit on saved data. `--skip` (default 120 s) leaves out the controller's settling
+period after the pad first reaches its target.
+
+### 4. Check
+
+Put the values in your config and restart Klipper. On a later cold heat-up to a different
+target (e.g. 60 °C), compare an IR reading with the `virtual_bed_temp` value in Mainsail.
+
+**Accuracy.** The plate's rate comes from about 20 minutes of power data, so IR timing and reading
+errors hardly affect it. In simulations with a noisy controller and IR readings off by ±0.6 °C,
+the tool recovered `time_constant` within 1 % and `loss` within 0.003
+(`tools/fit_tau.py --selftest TAU LOSS [--csv …]`). The weakest link is the IR thermometer's
+absolute accuracy, which mainly affects `loss`.
+
+**Other reference sensors.** A thermistor taped to the plate and declared as
+`[temperature_sensor …]` also works: use `--ref "temperature_sensor plate_ref"` instead of `--csv`.
+
+**Why not use the nozzle as the reference?** A cold nozzle resting on the bed touches it over a
 tiny area. The heater block is a large mass that also loses heat to the air, the heat break and
 the fans, so it reads many degrees low and adds its own lag. The resulting `time_constant` would
 be wrong.

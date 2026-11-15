@@ -1,45 +1,64 @@
 #!/usr/bin/env python3
-"""Fit time_constant and loss of [virtual_bed_temp] to a recorded heat-up.
+"""Calibrate [virtual_bed_temp] (time_constant, loss) from one recorded heat-up.
 
-Data source: Moonraker /server/temperature_store (1 sample/s, newest last,
-default 1200 s history). The heat-up start (t=0) is the first sample where
-the heater target rises from <=0 to >0, or --start-ago seconds before the
-newest sample.
+Data: Moonraker /server/temperature_store (1 sample/s, newest last, default
+1200 s history). t=0 is the last sample where the heater target rises from
+<=0 to >0, or --start-ago seconds before the newest sample.
 
-Plate reference, one of:
-  --ref NAME   a Klipper sensor logged by Moonraker, e.g.
-               "temperature_sensor plate_ref"
-  --csv FILE   manual readings, lines "seconds,temp_c", seconds since t=0
+Stage 1, heater power (no extra hardware): once the pad thermistor holds its
+target, the heater supplies the heat flowing into the plate plus roughly
+constant losses, so the power decays as
+    P(t) = P_steady + A * exp(-k t),   k = (1 + loss) / time_constant
+k is fitted after the pad first reaches target plus --skip seconds of
+controller settling.
 
-The model is simulated over the recorded heater trace, starting from the
-plate's equilibrium temperature (first reference sample, else heater temp at
-t=0), which is also used as ambient unless --ambient is given.
+Stage 2, plate readings (optional, >= 2 recommended):
+  --csv FILE   IR thermometer readings, lines "seconds,temp_c", seconds since
+               t=0 (start a stopwatch with M140)
+  --ref NAME   a Klipper sensor on the plate logged by Moonraker
+The model is simulated over the recorded pad temperature with k fixed and
+loss chosen to fit the readings. A fit from the readings alone is reported as
+a cross-check. Without readings: loss = 0, time_constant = 1/k.
+
+Plate starts at equilibrium with the pad at t=0 (or at the first reading taken
+at t=0); that temperature is the ambient unless --ambient is given.
 
 Stdlib only. Exit status 1 on missing/inconsistent data.
 """
 import argparse
 import json
 import math
+import random
 import sys
 import urllib.request
 
 DT = 1.  # Moonraker temperature_store sample interval, s
+LOSS_GRID = [i * 0.002 for i in range(151)]  # 0 .. 0.3
+TAU_RANGE = (20., 5000.)
 
 
 def fetch_store(url):
-    """Return Moonraker's temperature store: {name: {"temperatures": [...], ...}}."""
+    """Moonraker temperature store: {name: {"temperatures": [...], ...}}."""
     with urllib.request.urlopen(url.rstrip('/') + '/server/temperature_store',
                                 timeout=10) as resp:
         return json.load(resp)['result']
 
 
 def find_start(targets):
-    """Index of the last <=0 → >0 target transition; None if absent."""
+    """Index of the last <=0 -> >0 target transition; None if absent."""
     start = None
     for i in range(1, len(targets)):
         if targets[i - 1] <= 0. < targets[i]:
             start = i
     return start
+
+
+def first_reached(temps, target, tol=0.5):
+    """Index of the first sample >= target - tol; None if never."""
+    for i, t in enumerate(temps):
+        if t >= target - tol:
+            return i
+    return None
 
 
 def simulate(heater, tau, loss, t_init, ambient):
@@ -76,14 +95,48 @@ def golden(f, lo, hi, iters=60):
     return (a + b) / 2
 
 
-def fit(heater, ref, t_init, ambient, fit_loss, tau_range=(20., 5000.)):
-    """Best (tau, loss, rms). loss grid 0..0.3 step 0.005 when fit_loss, else 0."""
+def exp_fit(power, tau_eff):
+    """Least-squares P = a + b*exp(-t/tau_eff) over power[0..]; (a, b, rms)."""
+    n = len(power)
+    e = [math.exp(-i * DT / tau_eff) for i in range(n)]
+    se, see = sum(e), sum(x * x for x in e)
+    sp, sep = sum(power), sum(x * p for x, p in zip(e, power))
+    det = n * see - se * se
+    if abs(det) < 1e-12:
+        return sp / n, 0., float('inf')
+    b = (n * sep - se * sp) / det
+    a = (sp - b * se) / n
+    res = math.sqrt(sum((a + b * x - p) ** 2 for x, p in zip(e, power)) / n)
+    return a, b, res
+
+
+def fit_power(power):
+    """Effective plate time constant 1/k (s) from the decaying power trace.
+    Returns (tau_eff, p_steady, amplitude, rms)."""
+    tau_eff = golden(lambda t: exp_fit(power, t)[2], *TAU_RANGE)
+    a, b, res = exp_fit(power, tau_eff)
+    return tau_eff, a, b, res
+
+
+def fit_loss_constrained(heater, ref, t_init, ambient, tau_eff):
+    """Best loss on LOSS_GRID with time_constant = (1+loss)*tau_eff.
+    Returns (tau, loss, rms)."""
     best = None
-    losses = [i * 0.005 for i in range(61)] if fit_loss else [0.]
-    for loss in losses:
+    for loss in LOSS_GRID:
+        tau = (1 + loss) * tau_eff
+        e = rms(simulate(heater, tau, loss, t_init, ambient), ref)
+        if best is None or e < best[2]:
+            best = (tau, loss, e)
+    return best
+
+
+def fit_free(heater, ref, t_init, ambient, fit_loss=True):
+    """Best (tau, loss, rms) from plate readings alone."""
+    best = None
+    for loss in (LOSS_GRID[::5] if fit_loss else [0.]):
         def err(tau):
             return rms(simulate(heater, tau, loss, t_init, ambient), ref)
-        tau = golden(err, *tau_range)
+        tau = golden(err, *TAU_RANGE)
         e = err(tau)
         if best is None or e < best[2]:
             best = (tau, loss, e)
@@ -106,8 +159,8 @@ def time_to_reach(target, margin, tau, loss, ambient):
     return math.log((steady - ambient) / margin) / k
 
 
-def load_csv(path, start):
-    """Manual readings as [(store index, temp)]; seconds rounded to samples."""
+def load_csv(path):
+    """Manual readings as [(seconds index since t=0, temp)]."""
     ref = []
     with open(path) as f:
         for line in f:
@@ -115,22 +168,45 @@ def load_csv(path, start):
             if not line:
                 continue
             sec, temp = (float(x) for x in line.split(','))
-            ref.append((start + int(round(sec / DT)), temp))
+            ref.append((int(round(sec / DT)), temp))
     return ref
 
 
-def synthetic(tau, loss, ambient=22., target=80., n=1500):
-    """Store-shaped data: heater ramps to target in ~90 s, plate follows the model."""
-    heater, targets = [], []
-    h = ambient
+def synthetic(tau, loss, ambient=22., target=80., n=1500, lead=100,
+              watts=750., max_power=0.6, c_plate=2500., c_pad=150.):
+    """Store-shaped data from a two-node pad/plate simulation with a PI
+    controller on the pad thermistor; physics independent of the fitted model.
+    Plate: C dT/dt = G (T_pad - T) - h (T - T_amb), G = C/tau, h = loss*G.
+    Pad thermistor reading carries 0.15 °C gaussian noise (fixed seed), which
+    makes the controller's power noisy like a real PID.
+    Also returns the true plate trace under 'temperature_sensor plate_ref'."""
+    rng = random.Random(1)
+    g = c_plate / tau
+    h = loss * g
+    h_pad = 0.5  # W/K pad underside loss
+    t_pad = t_plate = ambient
+    integ = 0.
+    temps, targets, powers, plate = [], [], [], []
     for i in range(n):
-        tgt = target if i >= 100 else 0.
+        tgt = target if i >= lead else 0.
+        measured = t_pad + rng.gauss(0., 0.15)
         if tgt:
-            h += (tgt - h) * DT / 20.
-        heater.append(h)
+            err = tgt - measured
+            u = 0.08 * err + integ
+            if 0. < u < max_power:
+                integ += 0.004 * err * DT
+            pwm = min(max(u, 0.), max_power)
+        else:
+            pwm = 0.
+        q_pp = g * (t_pad - t_plate)
+        t_pad += (pwm * watts - q_pp - h_pad * (t_pad - ambient)) * DT / c_pad
+        t_plate += (q_pp - h * (t_plate - ambient)) * DT / c_plate
+        temps.append(measured)
         targets.append(tgt)
-    plate = simulate(heater, tau, loss, ambient, ambient)
-    return {'heater_bed': {'temperatures': heater, 'targets': targets},
+        powers.append(pwm)
+        plate.append(t_plate)
+    return {'heater_bed': {'temperatures': temps, 'targets': targets,
+                           'powers': powers},
             'temperature_sensor plate_ref': {'temperatures': plate}}
 
 
@@ -142,23 +218,29 @@ def main():
                      help='e.g. http://mainsailos.local:7125')
     src.add_argument('--load', metavar='FILE', help='store JSON saved with --save')
     src.add_argument('--selftest', nargs=2, type=float, metavar=('TAU', 'LOSS'),
-                     help='fit synthetic data generated with known TAU, LOSS')
-    ap.add_argument('--save', metavar='FILE', help='write the fetched store to FILE')
+                     help='synthetic two-node heat-up with known TAU, LOSS; '
+                          'combine with --csv to test IR readings')
+    ap.add_argument('--save', metavar='FILE', help='write the store to FILE')
     ap.add_argument('--heater', default='heater_bed')
     ref_src = ap.add_mutually_exclusive_group()
-    ref_src.add_argument('--ref', metavar='SENSOR')
     ref_src.add_argument('--csv', metavar='FILE')
+    ref_src.add_argument('--ref', metavar='SENSOR')
     ap.add_argument('--start-ago', type=int, metavar='S',
                     help='t=0 is S seconds before the newest sample')
+    ap.add_argument('--skip', type=int, default=120, metavar='S',
+                    help='controller settling after the pad reaches target, '
+                         'excluded from the power fit (default 120)')
     ap.add_argument('--ambient', type=float)
     ap.add_argument('--no-loss', action='store_true', help='fix loss at 0')
     ap.add_argument('--margin', type=float, default=2.,
-                    help='TEMPERATURE_WAIT margin for the timing table, °C')
+                    help='WAIT_VIRTUAL_BED_TEMP margin for the soak table, °C')
     args = ap.parse_args()
 
     if args.selftest:
         store = synthetic(*args.selftest)
-        args.ref = 'temperature_sensor plate_ref'
+        print('selftest truth: time_constant %.0f, loss %.3f, k-time %.0f s'
+              % (args.selftest[0], args.selftest[1],
+                 args.selftest[0] / (1 + args.selftest[1])))
     elif args.load:
         with open(args.load) as f:
             store = json.load(f)
@@ -167,52 +249,92 @@ def main():
     if args.save:
         with open(args.save, 'w') as f:
             json.dump(store, f)
-    if not (args.ref or args.csv):
-        sys.exit('error: need --ref or --csv')
     if args.heater not in store:
         sys.exit('error: %s not in store (have: %s)' % (args.heater, ', '.join(store)))
 
-    temps = store[args.heater]['temperatures']
+    hs = store[args.heater]
+    temps = hs['temperatures']
     if args.start_ago is not None:
         start = len(temps) - 1 - args.start_ago
     else:
-        start = find_start(store[args.heater].get('targets', []))
+        start = find_start(hs.get('targets', []))
     if start is None or not 0 <= start < len(temps):
         sys.exit('error: heat-up start not found in store — pass --start-ago')
     heater = temps[start:]
+    target = hs['targets'][start] if hs.get('targets') else max(heater)
 
+    # Stage 1: power decay
+    if 'powers' not in hs:
+        sys.exit('error: store has no heater powers')
+    reached = first_reached(heater, target)
+    if reached is None:
+        sys.exit('error: pad never reached its target %.1f in the record' % target)
+    p0 = reached + args.skip
+    power = hs['powers'][start + p0:]
+    if len(power) < 120:
+        sys.exit('error: only %d s of power data after pad reached target + skip'
+                 % len(power))
+    tau_eff, p_ss, amp, p_rms = fit_power(power)
+    print('heat-up:       target %.0f °C, pad reached it after %d s, '
+          'power fit over %d s' % (target, reached, len(power)))
+    print('power fit:     P = %.3f + %.3f·exp(−t/%.0f s), rms %.3f'
+          % (p_ss, amp, tau_eff, p_rms))
+    if amp <= 0:
+        print('warning: power is not decaying — wrong window? check --skip/--start-ago')
+    if len(power) * DT < 2.5 * tau_eff:
+        print('warning: power record covers < 2.5 time constants — record longer'
+              ' (raise temperature_store_size)')
+
+    # Stage 2: plate readings; sample before the target rise is still at equilibrium
+    t_init = temps[start - 1] if start > 0 else heater[0]
+    ref = []
     if args.csv:
-        ref = [(i - start, t) for i, t in load_csv(args.csv, start)]
-        t_init = ref[0][1] if ref and ref[0][0] == 0 else heater[0]
-    else:
+        ref = load_csv(args.csv)
+        if ref and ref[0][0] == 0:
+            t_init = ref[0][1]
+    elif args.ref:
         if args.ref not in store:
             sys.exit('error: %s not in store (have: %s)' % (args.ref, ', '.join(store)))
         plate = store[args.ref]['temperatures'][start:]
-        ref = list(enumerate(plate))
+        ref = list(enumerate(plate))[::60]  # one reading per minute
         t_init = plate[0]
-    ref = [(i, t) for i, t in ref if 0 <= i < len(heater)]
-    if len(ref) < 3:
-        sys.exit('error: fewer than 3 reference points inside the recorded window')
+    ref = [(i, t) for i, t in ref if 0 < i < len(heater)]
     ambient = t_init if args.ambient is None else args.ambient
 
-    tau, loss, err = fit(heater, ref, t_init, ambient, not args.no_loss)
-    print('samples:       %d s of heater data, %d reference points' % (len(heater), len(ref)))
-    print('start temp:    %.1f °C   ambient: %.1f °C' % (t_init, ambient))
+    if ref and not args.no_loss:
+        tau, loss, err = fit_loss_constrained(heater, ref, t_init, ambient, tau_eff)
+        print('readings:      %d, rms vs model %.2f °C' % (len(ref), err))
+        if loss >= LOSS_GRID[-1]:
+            print('warning: loss hit its upper bound — readings far below the pad;'
+                  ' check IR emissivity / timing')
+        free = fit_free(heater, ref, t_init, ambient)
+        print('cross-check:   readings alone → time_constant %.0f, loss %.3f'
+              ' (rms %.2f °C)' % free)
+        k_free = free[0] / (1 + free[1])
+        if abs(k_free - tau_eff) / tau_eff > 0.25:
+            print('warning: readings and power disagree by > 25 %% on the plate '
+                  'rate (%.0f s vs %.0f s); recheck reading times' % (k_free, tau_eff))
+    else:
+        tau, loss = tau_eff, 0.
+        if ref:
+            print('readings:      %d, rms vs model %.2f °C'
+                  % (len(ref), rms(simulate(heater, tau, 0., t_init, ambient), ref)))
+        else:
+            print('readings:      none — loss fixed at 0')
+
+    print('\nstart temp:    %.1f °C   ambient: %.1f °C' % (t_init, ambient))
     print('time_constant: %.0f' % tau)
     print('loss:          %.3f' % loss)
-    print('rms error:     %.2f °C' % err)
-    if heater[-1] - heater[0] > 0 and len(heater) * DT < 3 * tau:
-        print('warning: record covers < 3·tau — fit is extrapolating, record longer')
     for name in store:
-        if name.split()[0] == 'virtual_bed_temp':
+        if name.split()[0] == 'virtual_bed_temp' and ref:
             cur = store[name]['temperatures'][start:]
-            print('current %s rms vs reference: %.2f °C' % (name, rms(cur, ref)))
+            print('current %s rms vs readings: %.2f °C' % (name, rms(cur, ref)))
     print('\nsoak from %.0f °C until plate is within %.1f °C of steady state'
           ' (ideal heater step):' % (ambient, args.margin))
-    for target in (60., 80., 100., 110.):
-        t = time_to_reach(target, args.margin, tau, loss, ambient)
+    for tgt in (60., 80., 100., 110.):
+        t = time_to_reach(tgt, args.margin, tau, loss, ambient)
         print('  bed %5.0f °C: plate steady %5.1f °C, %4.1f min'
-              % (target, steady_state(target, loss, ambient), t / 60))
+              % (tgt, steady_state(tgt, loss, ambient), t / 60))
     print('\n[virtual_bed_temp]\ntime_constant: %.0f\nloss: %.3f\nambient_temp: %.0f'
           % (tau, loss, ambient))
 
