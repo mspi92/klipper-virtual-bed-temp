@@ -143,8 +143,18 @@ def slope(values):
     return num / sum((i - xm) ** 2 for i in range(n))
 
 
+def power_needed(r):
+    """Seconds of power data a fit_tau.analyze result r needs: MIN_POWER_SPANS
+    plate rates, using the rate of the chosen source (time_constant/(1+loss)
+    equals the power rate unless the readings-only fit overrode it)."""
+    return fit_tau.MIN_POWER_SPANS * r['tau'] / (1 + r['loss'])
+
+
 def fmt_t(s):
-    return '%d:%02d' % (s // 60, s % 60)
+    """Duration in seconds as '45s' / '3m00s'; unit always shown so it can't
+    be mistaken for a clock time."""
+    s = int(s)
+    return '%ds' % s if s < 60 else '%dm%02ds' % (s // 60, s % 60)
 
 
 def flush_typeahead():
@@ -328,7 +338,7 @@ class Session:
     def announce(self, next_prompt, el):
         """Tell the user when the next reading is due: run time, wall clock."""
         wait = max(next_prompt - el, 0.)
-        self.say('  next reading at %s (%s, in %s)'
+        self.say('  next reading at run time %s (%s, in %s)'
                  % (fmt_t(next_prompt),
                     time.strftime('%H:%M:%S', time.localtime(time.time() + wait)),
                     fmt_t(wait)))
@@ -394,7 +404,7 @@ class Session:
                 s = self.rec.last()
                 if s:
                     model = '' if s[4] is None else '  model %.1f' % s[4]
-                    print('  %s  pad %.1f/%.0f  power %3.0f%%%s  next reading in %s'
+                    print('  %6s  pad %.1f/%.0f  power %3.0f%%%s  next reading in %s'
                           % (fmt_t(el), s[1], s[2], s[3] * 100, model,
                              fmt_t(max(next_prompt - el, 0.))))
                 last_status = el
@@ -407,8 +417,8 @@ class Session:
         if el < a.min_duration:
             return False, ''
         r = self.analyze(quiet=True)
+        need = power_needed(r) if r else 0.
         # enough readings for the readings-only fallback in fit_tau.analyze
-        need = fit_tau.MIN_POWER_SPANS * (r['tau_eff'] if r else 0.)
         if (r and r['power_s'] >= need
                 and len(self.readings) >= fit_tau.MIN_READINGS_ALONE):
             return True, ('calibration complete: %d readings, %.0f s of heater '
@@ -436,7 +446,7 @@ class Session:
             self.say('  preliminary: time_constant ≈ %.0f, loss ≈ %.3f from %s '
                      '(%.0f s power data, want ≥ %.0f)'
                      % (r['tau'], r['loss'], r['source'], r['power_s'],
-                        fit_tau.MIN_POWER_SPANS * r['tau_eff']))
+                        power_needed(r)))
 
     def analyze(self, quiet=False):
         pad, power, _ = self.rec.series(self.t0, self.t_end)
@@ -474,11 +484,16 @@ class Session:
                  % (tau, loss, self.t_init))
         if self.model_cfg:
             ct, cl = self.model_cfg['time_constant'], self.model_cfg['loss']
-            if abs(tau - ct) / ct < 0.05 and abs(loss - cl) < 0.01:
+            ca = self.model_cfg.get('ambient_temp')
+            same_amb = ca is None or abs(self.t_init - ca) < 1.
+            if abs(tau - ct) / ct < 0.05 and abs(loss - cl) < 0.01 and same_amb:
                 self.say('Current config is already within 5 % — no change needed.')
             else:
-                self.say('Change:       time_constant %.0f → %.0f (%+.0f %%), '
-                         'loss %.3f → %.3f' % (ct, tau, (tau - ct) / ct * 100, cl, loss))
+                line = ('Change:       time_constant %.0f → %.0f (%+.0f %%), '
+                        'loss %.3f → %.3f' % (ct, tau, (tau - ct) / ct * 100, cl, loss))
+                if not same_amb:
+                    line += ', ambient_temp %.0f → %.0f' % (ca, self.t_init)
+                self.say(line)
         self.say('', *fit_tau.soak_table(tau, loss, self.t_init, 2.))
         self.say('', 'Put this into printer.cfg:', '',
                  '[%s]' % MODEL, 'heater: %s' % self.a.heater,

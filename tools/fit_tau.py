@@ -187,10 +187,6 @@ def analyze(heater, power, target, ref, t_init, ambient, skip=120,
     if amp <= 0:
         warnings.append('power is not decaying — wrong window?'
                         ' check --skip/--start-ago')
-    if len(power) * DT < MIN_POWER_SPANS * tau_eff:
-        warnings.append('power record covers < %.2g time constants'
-                        ' — rate still uncertain, record longer'
-                        % MIN_POWER_SPANS)
     ref = [(i, t) for i, t in ref if 0 < i < len(heater)]
     free = None
     source = 'power'
@@ -206,14 +202,15 @@ def analyze(heater, power, target, ref, t_init, ambient, skip=120,
                     tau, loss, ref_rms = free
                     source = 'readings'
                     warnings.append(
-                        'readings and power disagree by > 25 %% on the plate'
-                        ' rate (%.0f s vs %.0f s); using the readings-only fit'
-                        % (k_free, tau_eff))
+                        'plate rate (time_constant/(1+loss)) %.0f s from'
+                        ' readings vs %.0f s from power, > 25 %% apart;'
+                        ' using the readings-only fit' % (k_free, tau_eff))
                 else:
                     warnings.append(
-                        'readings and power disagree by > 25 %% on the plate'
-                        ' rate (%.0f s vs %.0f s); take >= %d readings to'
-                        ' decide' % (k_free, tau_eff, MIN_READINGS_ALONE))
+                        'plate rate (time_constant/(1+loss)) %.0f s from'
+                        ' readings vs %.0f s from power, > 25 %% apart;'
+                        ' take >= %d readings to decide'
+                        % (k_free, tau_eff, MIN_READINGS_ALONE))
         if loss >= LOSS_GRID[-1]:
             warnings.append('loss hit its upper bound — readings far below'
                             ' the pad; check IR emissivity / timing')
@@ -221,6 +218,10 @@ def analyze(heater, power, target, ref, t_init, ambient, skip=120,
         tau, loss = tau_eff, 0.
         ref_rms = (rms(simulate(heater, tau, 0., t_init, ambient), ref)
                    if ref else None)
+    if source != 'readings' and len(power) * DT < MIN_POWER_SPANS * tau_eff:
+        warnings.append('power record covers < %.2g time constants'
+                        ' — rate still uncertain, record longer'
+                        % MIN_POWER_SPANS)
     return {'reached': reached, 'power_s': len(power), 'tau_eff': tau_eff,
             'p_steady': p_ss, 'amp': amp, 'p_rms': p_rms, 'tau': tau,
             'loss': loss, 'source': source, 'ref_rms': ref_rms, 'free': free,

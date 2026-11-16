@@ -80,6 +80,7 @@ class SimPrinter:
         self.speed, self.ambient, self.ignore = speed, ambient, set(ignore)
         self.model = ambient
         self.model_tau, self.model_loss = 300., 0.
+        self.model_ambient = ambient
         self.idle_timeout, self.last_gcode = 300., 0.
         self.gcodes = []
         self.t0_real = time.monotonic()
@@ -109,7 +110,8 @@ class SimPrinter:
                                    'target': self.bed.target, 'power': self.bed.pwm},
                     'virtual_bed_temp': {'temperature': self.model,
                                          'time_constant': self.model_tau,
-                                         'loss': self.model_loss},
+                                         'loss': self.model_loss,
+                                         'ambient_temp': self.model_ambient},
                     'print_stats': {'state': 'standby'},
                     'idle_timeout': {'idle_timeout': self.idle_timeout}}
 

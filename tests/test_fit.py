@@ -83,6 +83,19 @@ class WithReadings(unittest.TestCase):
         self.assertEqual(r2['source'], 'power+readings')
         self.assertTrue(any('take >= 3' in w for w in r2['warnings']), r2['warnings'])
 
+    def test_no_span_warning_for_readings_only_result(self):
+        """Power from a very slow plate covers < 1.25 of its rate: warned
+        without readings, silent once the readings-only fit replaces it."""
+        tau, loss = 214., 0.39
+        pad, _, true = heatup(tau, loss, 16)
+        _, pw_slow, _ = heatup(1500., loss, 16)
+        r = fit_tau.analyze(pad, pw_slow, 80., [], 22., 22.)
+        self.assertTrue(any('time constants' in w for w in r['warnings']), r['warnings'])
+        ref = [(t, true[t]) for t in (180, 360, 540, 720, 900)]
+        r = fit_tau.analyze(pad, pw_slow, 80., ref, 22., 22.)
+        self.assertEqual(r['source'], 'readings', r['warnings'])
+        self.assertFalse(any('time constants' in w for w in r['warnings']), r['warnings'])
+
     def test_slow_power_limited_pad(self):
         """Pad stuck at max_power for ~5 min (measured printer)."""
         d = synthetic(214., 0.39, n=LEAD + 16 * 60, lead=LEAD, watts=SLOW_WATTS)

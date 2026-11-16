@@ -111,8 +111,8 @@ One heat-up of about 15–20 minutes, plus a handheld IR thermometer. No extra s
 
 When the two agree, the rate comes from the power and `loss` from the readings. On a real Voron
 whose heater is limited by `max_power: 0.6`, the pad took 5–6 minutes to reach its target. That
-left only a short, noisy power decay, and two runs on the same plate gave rates of 188 s and 278 s.
-The IR readings agreed between those runs (156 s and 160 s). So when power and readings disagree by
+left only a short, noisy power decay, and three runs on the same plate gave rates of 188 s, 278 s
+and 378 s. The IR readings agreed between those runs (156 s, 160 s and 145 s). So when power and readings disagree by
 more than 25 % and there are at least 3 readings, the result comes from the readings alone, and the
 script says so.
 
@@ -130,7 +130,7 @@ What it does:
 - Asks for a first IR reading as the starting value, then starts heating with `M140 S80`.
 - Records bed temperature and heater power itself, once per second. No Moonraker history settings
   are needed.
-- Asks for an IR reading of the plate every 3 minutes, at fixed run times (3:00, 6:00, 9:00, …).
+- Asks for an IR reading of the plate every 3 minutes, at fixed run times (3m00s, 6m00s, 9m00s, …).
   Before each one it tells you when the next reading is due, both as run time and as clock time.
   It beeps 30 s before and again when it's time. Type the number and press Enter; the reading is
   dated 10 s before you pressed Enter, to allow for walking back to the keyboard.
@@ -207,8 +207,8 @@ target (e.g. 60 °C), compare an IR reading with the `virtual_bed_temp` value in
 
 **Accuracy.** In simulations with a noisy controller and IR readings off by ±1 °C, the tool
 recovered `time_constant` within about 5 % (see `tests/`). Real hardware is less ideal. On the
-Voron above, two runs fitted from readings alone agreed within 2 %, and the model matched all six
-readings to within 0.7 °C rms. The weakest link is the IR thermometer's absolute accuracy, which
+Voron above, three runs fitted from readings alone gave time constants of 218, 221 and 203 s (loss
+0.38–0.40). A joint fit of all eleven readings matched them to within 0.83 °C rms. The weakest link is the IR thermometer's absolute accuracy, which
 mainly affects `loss`.
 
 **Other reference sensors.** A thermistor taped to the plate and declared as

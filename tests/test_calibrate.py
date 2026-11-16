@@ -66,6 +66,7 @@ class EndToEnd(unittest.TestCase):
         """Measured-printer-like bed: readings on the 3 min grid, each one
         announced, run ends at a scheduled reading (no surprise prompt)."""
         printer = SimPrinter(214., 0.39, speed=300., watts=SLOW_WATTS)
+        printer.model_ambient = 30.
         with tempfile.TemporaryDirectory() as tmp:
             s, out = run(printer, tmp)
             self.assertIsInstance(s, calibrate.Session, out)
@@ -73,12 +74,13 @@ class EndToEnd(unittest.TestCase):
             for i, t in enumerate(times):
                 self.assertAlmostEqual(t, 180 * (i + 1), delta=15, msg=out)
             self.assertGreaterEqual(len(s.readings), 5)
-            self.assertIn('next reading at 3:00', out)
+            self.assertIn('next reading at run time 3m00s', out)
             self.assertIn('get ready — reading at', out)
             self.assertNotIn('Final reading', out)
             self.assertIn('calibration complete', out)
             tau = float(out.split('Recommended:  time_constant')[1].split()[0])
             self.assertAlmostEqual(tau, 214., delta=15., msg=out)
+            self.assertIn('ambient_temp 30 → 22', out)
 
     def test_external_heater_off_aborts(self):
         """Idle timeout fires because SET_IDLE_TIMEOUT is dropped: run aborts
@@ -102,6 +104,18 @@ class Recorder(unittest.TestCase):
         # each second takes the latest sample at or before it
         self.assertEqual(pad, [20., 20., 21., 22., 24.])
         self.assertEqual(power, [0., 0., .6, .5, .4])
+
+    def test_power_needed_uses_chosen_rate(self):
+        """Readings-only result: span from time_constant/(1+loss), not from
+        the discarded power rate."""
+        r = {'tau': 203., 'loss': 0.4, 'tau_eff': 378., 'source': 'readings'}
+        self.assertAlmostEqual(calibrate.power_needed(r),
+                               fit_tau.MIN_POWER_SPANS * 145.)
+
+    def test_fmt_t_shows_unit(self):
+        self.assertEqual(calibrate.fmt_t(30.7), '30s')
+        self.assertEqual(calibrate.fmt_t(180), '3m00s')
+        self.assertEqual(calibrate.fmt_t(905), '15m05s')
 
     def test_slope(self):
         self.assertAlmostEqual(calibrate.slope([1., 2., 3., 4.]), 1.)
